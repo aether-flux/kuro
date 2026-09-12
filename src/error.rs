@@ -1,3 +1,4 @@
+use oci_spec::OciSpecError;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -22,11 +23,17 @@ pub enum KuroError {
     #[error("Invalid bundle path at {path}: {reason}")]
     InvalidBundle { path: PathBuf, reason: String },
 
+    #[error("State file not found for container {id}")]
+    ContainerStateNotFound { id: String },
+
     #[error("Container '{id}' not found")]
     ContainerNotFound { id: String },
 
     #[error("Container '{id}' is already running")]
     ContainerAlreadyExists { id: String },
+
+    #[error("Error with config specification: {0}")]
+    OciSpecError(#[from] OciSpecError),
 
     // --- Subsystem Specific Errors ---
     #[error("Namespace error: {0}")]
@@ -52,4 +59,14 @@ pub enum KuroError {
     // --- Catch-all Dynamic Error Wrapper ---
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+}
+
+// --- Validation Utils ---
+pub fn validate_id(container_id: &str) -> Result<()> {
+    if container_id.trim().is_empty() {
+        return Err(KuroError::InvalidArgs(
+            "container_id cannot be empty".to_string(),
+        ));
+    }
+    Ok(())
 }

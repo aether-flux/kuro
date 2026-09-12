@@ -5,13 +5,14 @@ use crate::{
     error::Result,
 };
 
+mod cgroups;
 mod cli;
 mod config;
 mod container;
 mod error;
-// mod cgroups;
-// mod namespaces;
-// mod sync;
+mod fs;
+mod namespaces;
+mod sync;
 
 fn main() -> Result<()> {
     let args = CliArgs::try_parse().unwrap_or_else(|e| e.exit());
