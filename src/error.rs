@@ -39,6 +39,9 @@ pub enum KuroError {
     #[error("Namespace error: {0}")]
     Namespace(String),
 
+    #[error("User namespace error: {0}")]
+    Userns(String),
+
     #[error("Cgroup error: {0}")]
     Cgroup(String),
 

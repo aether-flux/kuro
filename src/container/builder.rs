@@ -1,6 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use crate::{
+    cgroups::v2::CgroupMgr,
     error::{KuroError, Result},
     sync::pipe::SyncPipe,
 };
@@ -69,9 +70,18 @@ impl<'a> CBuilder<'a> {
             child_pid
         );
 
-        // TODO: Write UID/GID mappings
-        // TODO: Create and add child_pid to cgroups-v2
-        // TODO: Apply resource limits
+        // Setup cgroups
+        let cmgr = CgroupMgr::new(&self.container_id)?;
+        if let Some(linux) = self.spec.linux() {
+            if let Some(rsrcs) = linux.resources() {
+                cmgr.apply_limits(rsrcs)?;
+            }
+        }
+        cmgr.add_proc(child_pid)?;
+
+        // [x]   Write UID/GID mappings
+        // [x]   Create and add child_pid to cgroups-v2
+        // [x]   Apply resource limits
         // TODO: Setup network interfaces in netns
         // TODO: Save container state (status = Created)
         // TODO: createRuntime hooks
@@ -81,6 +91,8 @@ impl<'a> CBuilder<'a> {
 
         // Wait for child to ack rootfs + security setup
         child_to_parent.wait_for_signal()?;
+
+        // TODO: Handle existing namespaces setting (setns() if path given)
 
         Ok(child_pid)
     }
@@ -93,6 +105,7 @@ impl<'a> CBuilder<'a> {
         // TODO: Setup hostname
         // TODO: Mount filesystems and pivot_root
         // TODO: Apply capabilities, rlimits, env vars, no_new_privs
+        // TODO: createContainer hooks
 
         // Signal parent that container setup is ready
         child_to_parent.send_signal()?;
