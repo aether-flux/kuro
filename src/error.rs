@@ -42,6 +42,9 @@ pub enum KuroError {
     #[error("User namespace error: {0}")]
     Userns(String),
 
+    #[error("Network namespace error: {0}")]
+    Netns(String),
+
     #[error("Cgroup error: {0}")]
     Cgroup(String),
 

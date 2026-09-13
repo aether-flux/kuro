@@ -2,7 +2,9 @@ use std::{path::PathBuf, time::Duration};
 
 use crate::{
     cgroups::v2::CgroupMgr,
+    container::state::{ContainerState, ContainerStatus},
     error::{KuroError, Result},
+    namespaces::{netns::NetMgr, userns::UserMgr},
     sync::pipe::SyncPipe,
 };
 use nix::{
@@ -70,6 +72,15 @@ impl<'a> CBuilder<'a> {
             child_pid
         );
 
+        // Setup user namespace mappings
+        if let Some(linux) = self.spec.linux() {
+            UserMgr::set_mappings(
+                child_pid,
+                linux.uid_mappings().as_deref(),
+                linux.gid_mappings().as_deref(),
+            )?;
+        }
+
         // Setup cgroups
         let cmgr = CgroupMgr::new(&self.container_id)?;
         if let Some(linux) = self.spec.linux() {
@@ -79,11 +90,20 @@ impl<'a> CBuilder<'a> {
         }
         cmgr.add_proc(child_pid)?;
 
+        // Network setup
+        // NetMgr::setup_network(child_pid, None)?;
+
+        // Update and save state (status = Created)
+        let mut state = ContainerState::load(&self.container_id)?;
+        state.status = ContainerStatus::Created;
+        state.save()?;
+
         // [x]   Write UID/GID mappings
         // [x]   Create and add child_pid to cgroups-v2
         // [x]   Apply resource limits
-        // TODO: Setup network interfaces in netns
-        // TODO: Save container state (status = Created)
+        // [x]   Setup network interfaces in netns
+        // [x]   Save container state (status = Created)
+        // TODO: Network Manager implemented, but move calling from host to child process
         // TODO: createRuntime hooks
 
         // Signal child that host setup is done
@@ -93,6 +113,10 @@ impl<'a> CBuilder<'a> {
         child_to_parent.wait_for_signal()?;
 
         // TODO: Handle existing namespaces setting (setns() if path given)
+        // -> Do this by looping through linux.namespaces()
+        // -> For every ns, send typ() and path() to a fn setup_ns()
+        // -> Inside setup_ns(), check the type of ns, attach/create ns, and call setup fns as needed
+        // -> Handle PID namespaces with no path (ie CLONE_NEWPID) in host process, as unshare() fails
 
         Ok(child_pid)
     }

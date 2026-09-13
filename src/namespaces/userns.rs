@@ -38,7 +38,7 @@ impl UserMgr {
     }
 
     /// Write ID mappings
-    pub fn write_id_map(
+    fn write_id_map(
         child_pid: Pid,
         map_type: &str,
         mappings: &[LinuxIdMapping],
