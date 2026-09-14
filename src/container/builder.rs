@@ -1,4 +1,9 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    fs::File,
+    os::fd::AsFd,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use crate::{
     cgroups::v2::CgroupMgr,
@@ -8,7 +13,7 @@ use crate::{
     sync::pipe::SyncPipe,
 };
 use nix::{
-    sched::{CloneFlags, clone},
+    sched::{CloneFlags, clone, setns},
     sys::signal::Signal,
     unistd::Pid,
 };
@@ -126,10 +131,20 @@ impl<'a> CBuilder<'a> {
         // Wait for host to complete setup
         parent_to_child.wait_for_signal()?;
 
+        // Handle all namespaces
+        if let Some(linux) = self.spec.linux() {
+            if let Some(namespaces) = linux.namespaces() {
+                for ns in namespaces {
+                    Self::setup_ns(ns.typ(), ns.path().as_ref())?;
+                }
+            }
+        }
+
         // TODO: Setup hostname
         // TODO: Mount filesystems and pivot_root
         // TODO: Apply capabilities, rlimits, env vars, no_new_privs
         // TODO: createContainer hooks
+        // TODO: Masked and readonly paths
 
         // Signal parent that container setup is ready
         child_to_parent.send_signal()?;
@@ -142,6 +157,62 @@ impl<'a> CBuilder<'a> {
         }
 
         Ok(())
+    }
+
+    /// Detect and attach different namespaces dynamically
+    fn setup_ns(typ: LinuxNamespaceType, path: Option<&PathBuf>) -> Result<()> {
+        if let Some(path) = path {
+            // Path provided; attach existing namespace
+            let fd = File::open(&path).map_err(|e| {
+                KuroError::Namespace(format!("Failed to open namespace path: {}", e))
+            })?;
+            if let Some(flag) = Self::get_clone_flag(typ) {
+                setns(fd.as_fd(), flag).map_err(|e| {
+                    KuroError::Namespace(format!(
+                        "Failed to set namespace '{}' to path '{:?}': {}",
+                        typ.to_string(),
+                        path,
+                        e
+                    ))
+                })?;
+            } else {
+                // Unsupported flags / namespace types (time)
+                return Err(KuroError::Namespace(format!(
+                    "Unsupported namespace type: {}",
+                    typ.to_string()
+                )));
+            }
+        } else {
+            // Path not provided; create and setup new namespace
+            Self::call_setup_fns(typ)?;
+        }
+
+        Ok(())
+    }
+
+    /// Get clone flag from namespace type
+    fn get_clone_flag(typ: LinuxNamespaceType) -> Option<CloneFlags> {
+        match typ {
+            LinuxNamespaceType::Pid => Some(CloneFlags::CLONE_NEWPID),
+            LinuxNamespaceType::Network => Some(CloneFlags::CLONE_NEWNET),
+            LinuxNamespaceType::Ipc => Some(CloneFlags::CLONE_NEWIPC),
+            LinuxNamespaceType::Uts => Some(CloneFlags::CLONE_NEWUTS),
+            LinuxNamespaceType::Mount => Some(CloneFlags::CLONE_NEWNS),
+            LinuxNamespaceType::Cgroup => Some(CloneFlags::CLONE_NEWCGROUP),
+            LinuxNamespaceType::User => Some(CloneFlags::CLONE_NEWUSER),
+            // LinuxNamespaceType::Time => libc::CLONE_NEWTIME as CloneFlags,
+            _ => None,
+        }
+    }
+
+    /// Call namespace setup methods dynamically
+    fn call_setup_fns(typ: LinuxNamespaceType) -> Result<()> {
+        match typ {
+            LinuxNamespaceType::Network => NetMgr::setup_network(),
+            _ => Err(KuroError::Namespace(
+                "Unsupported namespace type".to_string(),
+            )),
+        }
     }
 
     /// Get clone flags from spec
