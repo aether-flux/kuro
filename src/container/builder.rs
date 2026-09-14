@@ -15,7 +15,7 @@ use crate::{
 use nix::{
     sched::{CloneFlags, clone, setns},
     sys::signal::Signal,
-    unistd::Pid,
+    unistd::{Pid, sethostname},
 };
 use oci_spec::runtime::{LinuxNamespaceType, Spec};
 
@@ -108,7 +108,7 @@ impl<'a> CBuilder<'a> {
         // [x]   Apply resource limits
         // [x]   Setup network interfaces in netns
         // [x]   Save container state (status = Created)
-        // TODO: Network Manager implemented, but move calling from host to child process
+        // [x]   Network Manager implemented, but move calling from host to child process
         // TODO: createRuntime hooks
 
         // Signal child that host setup is done
@@ -117,7 +117,7 @@ impl<'a> CBuilder<'a> {
         // Wait for child to ack rootfs + security setup
         child_to_parent.wait_for_signal()?;
 
-        // TODO: Handle existing namespaces setting (setns() if path given)
+        // [x]   Handle existing namespaces setting (setns() if path given)
         // -> Do this by looping through linux.namespaces()
         // -> For every ns, send typ() and path() to a fn setup_ns()
         // -> Inside setup_ns(), check the type of ns, attach/create ns, and call setup fns as needed
@@ -140,11 +140,18 @@ impl<'a> CBuilder<'a> {
             }
         }
 
-        // TODO: Setup hostname
-        // TODO: Mount filesystems and pivot_root
+        // Set hostname
+        if let Some(hostname) = self.spec.hostname() {
+            sethostname(hostname).map_err(|e| {
+                KuroError::Namespace(format!("Failed to set hostname '{}': {}", hostname, e))
+            })?;
+        }
+
+        // [x]   Setup hostname
+        // [x]   Mount filesystems and pivot_root
+        // TODO: Masked and readonly paths
         // TODO: Apply capabilities, rlimits, env vars, no_new_privs
         // TODO: createContainer hooks
-        // TODO: Masked and readonly paths
 
         // Signal parent that container setup is ready
         child_to_parent.send_signal()?;
@@ -161,6 +168,11 @@ impl<'a> CBuilder<'a> {
 
     /// Detect and attach different namespaces dynamically
     fn setup_ns(typ: LinuxNamespaceType, path: Option<&PathBuf>) -> Result<()> {
+        // EXCLUDE UserNS: Mapping already compelete in host
+        if typ == LinuxNamespaceType::User {
+            return Ok(());
+        }
+
         if let Some(path) = path {
             // Path provided; attach existing namespace
             let fd = File::open(&path).map_err(|e| {
@@ -209,6 +221,11 @@ impl<'a> CBuilder<'a> {
     fn call_setup_fns(typ: LinuxNamespaceType) -> Result<()> {
         match typ {
             LinuxNamespaceType::Network => NetMgr::setup_network(),
+            LinuxNamespaceType::Mount
+            | LinuxNamespaceType::Pid
+            | LinuxNamespaceType::Uts
+            | LinuxNamespaceType::Ipc
+            | LinuxNamespaceType::Cgroup => return Ok(()),
             _ => Err(KuroError::Namespace(
                 "Unsupported namespace type".to_string(),
             )),
@@ -222,15 +239,11 @@ impl<'a> CBuilder<'a> {
         if let Some(linux) = self.spec.linux() {
             if let Some(namespaces) = linux.namespaces() {
                 for ns in namespaces {
-                    match ns.typ() {
-                        LinuxNamespaceType::Pid => flags.insert(CloneFlags::CLONE_NEWPID),
-                        LinuxNamespaceType::Network => flags.insert(CloneFlags::CLONE_NEWNET),
-                        LinuxNamespaceType::Ipc => flags.insert(CloneFlags::CLONE_NEWIPC),
-                        LinuxNamespaceType::Uts => flags.insert(CloneFlags::CLONE_NEWUTS),
-                        LinuxNamespaceType::Mount => flags.insert(CloneFlags::CLONE_NEWNS),
-                        LinuxNamespaceType::Cgroup => flags.insert(CloneFlags::CLONE_NEWCGROUP),
-                        LinuxNamespaceType::User => flags.insert(CloneFlags::CLONE_NEWUSER),
-                        LinuxNamespaceType::Time => {}
+                    // Only add clone flags for namespaces having no external path
+                    if ns.path().is_none() {
+                        if let Some(flag) = Self::get_clone_flag(ns.typ()) {
+                            flags.insert(flag);
+                        }
                     }
                 }
             }

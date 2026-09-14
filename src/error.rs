@@ -48,6 +48,9 @@ pub enum KuroError {
     #[error("Cgroup error: {0}")]
     Cgroup(String),
 
+    #[error("Mount error: {0}")]
+    Mount(String),
+
     #[error("Mount failed for target '{target}': {source}")]
     MountFailed {
         target: String,
