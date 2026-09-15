@@ -58,6 +58,15 @@ pub enum KuroError {
         source: nix::Error,
     },
 
+    #[error("Capability error: {0}")]
+    Capability(String),
+
+    #[error("Rlimits error: {0}")]
+    Rlimits(String),
+
+    #[error("No new privileges error: {0}")]
+    NoNewPrivs(String),
+
     // --- Executation & Process Sync Errors ---
     #[error("Synchronization pipe error: {0}")]
     SyncPipe(String),

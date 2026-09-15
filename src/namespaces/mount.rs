@@ -1,22 +1,30 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use nix::{
     mount::{MntFlags, MsFlags, mount, umount2},
     unistd::{chdir, pivot_root},
 };
-use oci_spec::runtime::Spec;
+use oci_spec::runtime::{Linux, Spec};
 
 use crate::error::{KuroError, Result};
 
-// TODO: Masked and readonly paths
+// [x]   Masked and readonly paths
 
 pub struct MountMgr;
 
 impl MountMgr {
     /// Setup new mount namespace
-    pub fn setup_mount(spec: Spec, container_id: &str, bundle: &PathBuf) -> Result<()> {
+    pub fn setup_mount(spec: &Spec, container_id: &str, bundle: &PathBuf) -> Result<()> {
         Self::setup_overlayfs(&spec, container_id, bundle)?;
         Self::mount_fs(&spec)?;
+
+        if let Some(linux) = spec.linux() {
+            Self::set_masked(&linux)?;
+            Self::set_readonly(&linux)?;
+        }
 
         Ok(())
     }
@@ -172,5 +180,81 @@ impl MountMgr {
         let data = data_opts.join(",");
 
         (flags, data)
+    }
+
+    /// Set up readonly paths (RDONLY)
+    fn set_readonly(linux: &Linux) -> Result<()> {
+        if let Some(rdpaths) = linux.readonly_paths() {
+            for path in rdpaths {
+                // Mount as bind-mount
+                mount(
+                    Some(path.as_str()),
+                    path.as_str(),
+                    None::<&str>,
+                    MsFlags::MS_BIND | MsFlags::MS_REC,
+                    None::<&str>,
+                )
+                .map_err(|e| KuroError::MountFailed {
+                    target: path.to_owned(),
+                    source: e,
+                })?;
+                // Remount as read-only (RDONLY)
+                mount(
+                    None::<&str>,
+                    path.as_str(),
+                    None::<&str>,
+                    MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | MsFlags::MS_BIND | MsFlags::MS_REC,
+                    None::<&str>,
+                )
+                .map_err(|e| KuroError::MountFailed {
+                    target: path.to_owned(),
+                    source: e,
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Set up masked paths
+    fn set_masked(linux: &Linux) -> Result<()> {
+        if let Some(maskpaths) = linux.masked_paths() {
+            for path in maskpaths {
+                let path = Path::new(path);
+                if !path.exists() {
+                    continue;
+                }
+
+                if path.is_dir() {
+                    // If path is a directory, mask it over an empty read-only tmpfs directory
+                    mount(
+                        Some("tmpfs"),
+                        path,
+                        Some("tmpfs"),
+                        MsFlags::MS_RDONLY,
+                        Some("mode=000"),
+                    )
+                    .map_err(|e| KuroError::MountFailed {
+                        target: path.to_string_lossy().to_string(),
+                        source: e,
+                    })?;
+                } else {
+                    // If path is a file, bind-mount it over /dev/null
+                    mount(
+                        Some("/dev/null"),
+                        path,
+                        None::<&str>,
+                        MsFlags::MS_BIND,
+                        None::<&str>,
+                    )
+                    .map_err(|e| KuroError::MountFailed {
+                        target: path.to_string_lossy().to_string(),
+                        source: e,
+                    })?;
+                }
+            }
+        }
+
+        Ok(())
     }
 }

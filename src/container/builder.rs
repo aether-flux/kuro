@@ -9,7 +9,7 @@ use crate::{
     cgroups::v2::CgroupMgr,
     container::state::{ContainerState, ContainerStatus},
     error::{KuroError, Result},
-    namespaces::{netns::NetMgr, userns::UserMgr},
+    namespaces::{mount::MountMgr, netns::NetMgr, userns::UserMgr},
     sync::pipe::SyncPipe,
 };
 use nix::{
@@ -147,9 +147,12 @@ impl<'a> CBuilder<'a> {
             })?;
         }
 
+        // Setup mounts, pivot_root, and masked/readonly paths
+        MountMgr::setup_mount(self.spec, &self.container_id, &self.bundle_path)?;
+
         // [x]   Setup hostname
         // [x]   Mount filesystems and pivot_root
-        // TODO: Masked and readonly paths
+        // [x]   Masked and readonly paths
         // TODO: Apply capabilities, rlimits, env vars, no_new_privs
         // TODO: createContainer hooks
 

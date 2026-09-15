@@ -10,7 +10,6 @@ mod cli;
 mod config;
 mod container;
 mod error;
-mod fs;
 mod namespaces;
 mod sync;
 
