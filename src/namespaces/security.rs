@@ -8,11 +8,14 @@ use nix::{
     },
     unistd::{Gid, Uid, setgroups, setresgid, setresuid},
 };
-use oci_spec::runtime::{LinuxCapabilities, PosixRlimit, Spec, User};
+use oci_spec::runtime::{
+    LinuxCapabilities, LinuxSeccomp, LinuxSeccompAction, PosixRlimit, Spec, User,
+};
+use syscallz::{Action, Context, Syscall};
 
 use crate::error::{KuroError, Result};
 
-// TODO: Use syscallz crate and finish the method set_seccomp()
+// [x]   Use syscallz crate and finish the method set_seccomp()
 
 pub struct SecMgr;
 
@@ -176,5 +179,59 @@ impl SecMgr {
             .map_err(|e| KuroError::Userns(format!("Failed setresuid: {}", e)))?;
 
         Ok(())
+    }
+
+    /// Apply Seccomp filtering
+    pub fn apply_seccomp(seccomp_spec: &LinuxSeccomp) -> Result<()> {
+        let default_action = Self::map_seccomp(seccomp_spec.default_action())?;
+
+        // Initialize syscallz with default action
+        let mut ctx = Context::init_with_action(default_action).map_err(|e| {
+            KuroError::Seccomp(format!("Failed to initialize seccomp context: {}", e))
+        })?;
+
+        // Load syscall rules from config
+        if let Some(syscall_specs) = seccomp_spec.syscalls() {
+            for spec in syscall_specs {
+                let action = Self::map_seccomp(spec.action())?;
+
+                for name in spec.names() {
+                    if let Some(syscall) = Syscall::from_name(name) {
+                        ctx.set_action_for_syscall(action, syscall).map_err(|e| {
+                            KuroError::Seccomp(format!("Failed rule for '{}': {}", name, e))
+                        })?;
+                    } else {
+                        // Skip unknown syscalls
+                        eprintln!("WARN: Unknown syscall name in config: {}", name);
+                    }
+                }
+            }
+        }
+
+        ctx.load().map_err(|e| {
+            KuroError::Seccomp(format!("Failed to load seccomp filter into kernel: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    /// Map seccomp action to syscallz Action
+    fn map_seccomp(action: LinuxSeccompAction) -> Result<Action> {
+        let res = match action {
+            LinuxSeccompAction::ScmpActAllow => Action::Allow,
+            LinuxSeccompAction::ScmpActErrno => Action::Errno(1),
+            LinuxSeccompAction::ScmpActKill => Action::KillThread,
+            LinuxSeccompAction::ScmpActKillProcess => Action::KillProcess,
+            LinuxSeccompAction::ScmpActLog => Action::Allow,
+            LinuxSeccompAction::ScmpActTrap => Action::Trap,
+            _ => {
+                return Err(KuroError::Seccomp(format!(
+                    "Unsupported seccomp action: {:?}",
+                    action
+                )));
+            }
+        };
+
+        Ok(res)
     }
 }

@@ -3,7 +3,11 @@ use std::{collections::HashMap, path::PathBuf};
 use crate::{
     cli::commands::{CliArgs, Commands},
     config::spec::load_spec,
-    container::state::{ContainerState, ContainerStatus},
+    container::{
+        builder::CBuilder,
+        cleanup::ContainerCleanup,
+        state::{ContainerState, ContainerStatus},
+    },
     error::{KuroError, Result, validate_id},
 };
 
@@ -70,10 +74,22 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
 
             // Save initial state to disk
             state.save()?;
-            println!(
-                "Container '{}' state initialized with Creating",
-                container_id
-            );
+
+            // Run container builder
+            let mut builder = CBuilder::new(container_id.to_owned(), bundle_path, &spec);
+            match builder.create() {
+                Ok(pid) => println!(
+                    "[kuro] Container {} created successfully with PID {}",
+                    container_id,
+                    pid.to_string()
+                ),
+                Err(e) => {
+                    eprintln!("[kuro] {}", e);
+                    ContainerCleanup::new(container_id.as_str(), builder.pid).cleanup()?;
+
+                    return Err(e);
+                }
+            }
         }
 
         // // Start
@@ -87,7 +103,8 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
         Commands::State { container_id } => {
             validate_id(&container_id)?;
 
-            println!("State of container {} is 'ded'", container_id);
+            let state = ContainerState::load(container_id)?;
+            println!("{}", serde_json::to_string_pretty(&state).unwrap());
         }
 
         // // Kill
@@ -107,7 +124,23 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
         Commands::Delete { container_id } => {
             validate_id(&container_id)?;
 
-            println!("Deleting container {}...", container_id);
+            println!("[kuro] Deleting container {}...", container_id);
+
+            let state = ContainerState::load(&container_id).ok();
+            let pid = state.as_ref().map(|s| s.pid);
+
+            ContainerCleanup::new(container_id, pid).cleanup()?;
+
+            // Poststop hooks
+            if let Some(s) = &state {
+                let bundle_path = PathBuf::from(&s.bundle);
+                if let Ok(spec) = load_spec(&bundle_path) {
+                    let builder = CBuilder::new(container_id.to_owned(), bundle_path, &spec);
+                    builder.run_hook("poststop")?;
+                }
+            }
+
+            return Ok(());
         }
     }
 

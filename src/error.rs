@@ -17,6 +17,9 @@ pub enum KuroError {
     Json(#[from] serde_json::Error),
 
     // --- CLI & Configuration Errors ---
+    #[error("Hook error: {0}")]
+    Hook(String),
+
     #[error("Invalid arguments: {0}")]
     InvalidArgs(String),
 
@@ -31,6 +34,9 @@ pub enum KuroError {
 
     #[error("Container '{id}' is already running")]
     ContainerAlreadyExists { id: String },
+
+    #[error("Container cleanup error: {0}")]
+    ContainerCleanup(String),
 
     #[error("Error with config specification: {0}")]
     OciSpecError(#[from] OciSpecError),
@@ -66,6 +72,9 @@ pub enum KuroError {
 
     #[error("No new privileges error: {0}")]
     NoNewPrivs(String),
+
+    #[error("Seccomp error: {0}")]
+    Seccomp(String),
 
     // --- Executation & Process Sync Errors ---
     #[error("Synchronization pipe error: {0}")]

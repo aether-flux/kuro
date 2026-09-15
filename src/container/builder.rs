@@ -1,7 +1,9 @@
 use std::{
     fs::File,
+    io::Write,
     os::fd::AsFd,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     time::Duration,
 };
 
@@ -9,7 +11,7 @@ use crate::{
     cgroups::v2::CgroupMgr,
     container::state::{ContainerState, ContainerStatus},
     error::{KuroError, Result},
-    namespaces::{mount::MountMgr, netns::NetMgr, userns::UserMgr},
+    namespaces::{mount::MountMgr, netns::NetMgr, security::SecMgr, userns::UserMgr},
     sync::pipe::SyncPipe,
 };
 use nix::{
@@ -17,7 +19,7 @@ use nix::{
     sys::signal::Signal,
     unistd::{Pid, sethostname},
 };
-use oci_spec::runtime::{LinuxNamespaceType, Spec};
+use oci_spec::runtime::{Hook, LinuxNamespaceType, Spec};
 
 // 1MB stack size for container child process
 const STACK_SIZE: usize = 1024 * 1024;
@@ -26,6 +28,7 @@ pub struct CBuilder<'a> {
     pub container_id: String,
     pub bundle_path: PathBuf,
     pub spec: &'a Spec,
+    pub pid: Option<i32>,
 }
 
 impl<'a> CBuilder<'a> {
@@ -35,11 +38,40 @@ impl<'a> CBuilder<'a> {
             container_id,
             bundle_path,
             spec,
+            pid: None,
         }
     }
 
+    /// Run lifecycle hooks
+    pub fn run_hook(&self, hook: &str) -> Result<()> {
+        if let Some(hooks) = self.spec.hooks() {
+            let hook_list = match hook {
+                "prestart" => hooks.prestart().as_deref(),
+                "createRuntime" => hooks.create_runtime().as_deref(),
+                "createContainer" => hooks.create_container().as_deref(),
+                "startContainer" => hooks.start_container().as_deref(),
+                "poststart" => hooks.poststart().as_deref(),
+                "poststop" => hooks.poststop().as_deref(),
+                _ => return Err(KuroError::Hook(format!("Unknown hook type: {}", hook))),
+            };
+
+            if let Some(list) = hook_list {
+                let state = ContainerState::load(&self.container_id)?;
+                let state_json = serde_json::to_string(&state).map_err(|e| {
+                    KuroError::Hook(format!("Failed to serialize container state: {}", e))
+                })?;
+
+                for hfn in list {
+                    Self::execute_hook(hfn, &state_json)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Create container
-    pub fn create(&self) -> Result<Pid> {
+    pub fn create(&mut self) -> Result<Pid> {
         // Create sync pipes
         let parent_to_child = SyncPipe::new()?;
         let child_to_parent = SyncPipe::new()?;
@@ -76,6 +108,7 @@ impl<'a> CBuilder<'a> {
             "[kuro-host] Spawned container init process with PID: {}",
             child_pid
         );
+        self.pid = Some(child_pid.as_raw());
 
         // Setup user namespace mappings
         if let Some(linux) = self.spec.linux() {
@@ -109,7 +142,7 @@ impl<'a> CBuilder<'a> {
         // [x]   Setup network interfaces in netns
         // [x]   Save container state (status = Created)
         // [x]   Network Manager implemented, but move calling from host to child process
-        // TODO: createRuntime hooks
+        // [x]   createRuntime hooks
 
         // Signal child that host setup is done
         parent_to_child.send_signal()?;
@@ -117,11 +150,15 @@ impl<'a> CBuilder<'a> {
         // Wait for child to ack rootfs + security setup
         child_to_parent.wait_for_signal()?;
 
-        // [x]   Handle existing namespaces setting (setns() if path given)
-        // -> Do this by looping through linux.namespaces()
-        // -> For every ns, send typ() and path() to a fn setup_ns()
-        // -> Inside setup_ns(), check the type of ns, attach/create ns, and call setup fns as needed
-        // -> Handle PID namespaces with no path (ie CLONE_NEWPID) in host process, as unshare() fails
+        // Child setup completed; can run hooks now
+        self.run_hook("prestart")?;
+        self.run_hook("createRuntime")?;
+
+        // Signal child that parent has run hooks
+        parent_to_child.send_signal()?;
+
+        // Wait for child to run their hooks
+        child_to_parent.wait_for_signal()?;
 
         Ok(child_pid)
     }
@@ -153,10 +190,27 @@ impl<'a> CBuilder<'a> {
         // [x]   Setup hostname
         // [x]   Mount filesystems and pivot_root
         // [x]   Masked and readonly paths
-        // TODO: Apply capabilities, rlimits, env vars, no_new_privs
-        // TODO: createContainer hooks
+        // [x]   Apply capabilities, rlimits, env vars, no_new_privs
+        // [x]   createContainer hooks
 
         // Signal parent that container setup is ready
+        child_to_parent.send_signal()?;
+
+        // Wait for parent to run hooks
+        parent_to_child.wait_for_signal()?;
+
+        // Parent has run hooks, now child will run hook
+        self.run_hook("createContainer")?;
+
+        // Setup capabilities, rlimits, env vars, and no_new_privs
+        SecMgr::setup_security(&self.spec)?;
+        if let Some(linux) = self.spec.linux() {
+            if let Some(seccomp) = linux.seccomp() {
+                SecMgr::apply_seccomp(&seccomp)?;
+            }
+        }
+
+        // Signal parent that child is ready and paused
         child_to_parent.send_signal()?;
 
         // TODO: Pause for 'kuro start' signal
@@ -253,5 +307,52 @@ impl<'a> CBuilder<'a> {
         }
 
         Ok(flags)
+    }
+
+    /// Execute hook function
+    fn execute_hook(hook: &Hook, state: &str) -> Result<()> {
+        let path = hook.path();
+        let mut cmd = Command::new(path);
+
+        if let Some(args) = hook.args() {
+            if args.len() > 1 {
+                cmd.args(&args[1..]);
+            }
+        }
+
+        if let Some(vars) = hook.env() {
+            for env in vars {
+                if let Some((key, val)) = env.split_once('=') {
+                    cmd.env(key, val);
+                }
+            }
+        }
+
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
+
+        let mut child = cmd.spawn().map_err(|e| {
+            KuroError::Hook(format!("Failed to spawn hook binary: {:?}: {}", path, e))
+        })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(state.as_bytes()).map_err(|e| {
+                KuroError::Hook(format!("Failed to write state JSON to hook stdin: {}", e))
+            })?;
+        }
+
+        let status = child
+            .wait()
+            .map_err(|e| KuroError::Hook(format!("Error waiting for hook process: {}", e)))?;
+        if !status.success() {
+            return Err(KuroError::Hook(format!(
+                "Hook '{:?}' failed with exit code: {:?}",
+                path,
+                status.code()
+            )));
+        }
+
+        Ok(())
     }
 }
