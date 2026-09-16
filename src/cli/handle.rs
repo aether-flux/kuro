@@ -9,9 +9,12 @@ use crate::{
         state::{ContainerState, ContainerStatus},
     },
     error::{KuroError, Result, validate_id},
+    sync::{fifo::ExecFifo, pipe::SyncPipe},
 };
 
 pub fn handle_commands(args: &CliArgs) -> Result<()> {
+    let mut spipe: Option<SyncPipe> = None;
+
     match &args.command {
         // --- OCI-Compliant Mandatory Commands ---
         // // Create
@@ -78,11 +81,14 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
             // Run container builder
             let mut builder = CBuilder::new(container_id.to_owned(), bundle_path, &spec);
             match builder.create() {
-                Ok(pid) => println!(
-                    "[kuro] Container {} created successfully with PID {}",
-                    container_id,
-                    pid.to_string()
-                ),
+                Ok((pid, start_pipe)) => {
+                    println!(
+                        "[kuro] Container {} created successfully with PID {}",
+                        container_id,
+                        pid.to_string()
+                    );
+                    spipe = Some(start_pipe);
+                }
                 Err(e) => {
                     eprintln!("[kuro] {}", e);
                     ContainerCleanup::new(container_id.as_str(), builder.pid).cleanup()?;
@@ -96,7 +102,36 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
         Commands::Start { container_id } => {
             validate_id(&container_id)?;
 
-            println!("Starting container {}...", container_id);
+            let mut state = ContainerState::load(&container_id)?;
+            if state.status != ContainerStatus::Created {
+                return Err(KuroError::Start(format!(
+                    "Container '{}' is in {:?} state, expected Created",
+                    &container_id, state.status
+                )));
+            }
+            if spipe.is_none() {
+                return Err(KuroError::Start(format!(
+                    "Container '{}' not created properly",
+                    &container_id
+                )));
+            }
+
+            let spec = load_spec(&PathBuf::from(&state.bundle))?;
+            // TODO: Execute startContainer hooks (container)
+            // CBuilder::run_hook(&spec, &container_id, "startContainer");
+
+            // Signal PID 1 to start container
+            // ExecFifo::signal_start(&state_dir)?;
+            spipe.unwrap().send_signal()?;
+
+            // Update status -> Running
+            state.status = ContainerStatus::Running;
+            state.save()?;
+
+            // TODO: Execute poststart hooks (runtime)
+            CBuilder::run_hook(&spec, &container_id, "poststart")?;
+
+            println!("Started container {}...", container_id);
         }
 
         // // State
@@ -135,8 +170,9 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
             if let Some(s) = &state {
                 let bundle_path = PathBuf::from(&s.bundle);
                 if let Ok(spec) = load_spec(&bundle_path) {
-                    let builder = CBuilder::new(container_id.to_owned(), bundle_path, &spec);
-                    builder.run_hook("poststop")?;
+                    // let builder = CBuilder::new(container_id.to_owned(), bundle_path, &spec);
+                    // builder.run_hook("poststop")?;
+                    CBuilder::run_hook(&spec, &container_id, "poststop")?;
                 }
             }
 

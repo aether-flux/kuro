@@ -23,11 +23,6 @@ impl SecMgr {
     /// Setup all security features
     pub fn setup_security(spec: &Spec) -> Result<()> {
         if let Some(proc) = spec.process() {
-            // Set env vars
-            if let Some(vars) = proc.env() {
-                Self::set_env_vars(vars)?;
-            }
-
             // Set rlimits
             if let Some(rlimits) = proc.rlimits() {
                 Self::set_rlimits(rlimits)?;
@@ -37,6 +32,9 @@ impl SecMgr {
             if let Some(val) = proc.no_new_privileges() {
                 Self::set_no_new_privs(val)?;
             }
+
+            // Drop/set UID/GID
+            Self::set_user(proc.user())?;
 
             // Set capabilities
             if let Some(caps) = proc.capabilities() {

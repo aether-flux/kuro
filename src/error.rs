@@ -26,6 +26,9 @@ pub enum KuroError {
     #[error("Invalid bundle path at {path}: {reason}")]
     InvalidBundle { path: PathBuf, reason: String },
 
+    #[error("Config error: {0}")]
+    InvalidSpec(String),
+
     #[error("State file not found for container {id}")]
     ContainerStateNotFound { id: String },
 
@@ -82,6 +85,10 @@ pub enum KuroError {
 
     #[error("Command execution failed: {0}")]
     ExecFailed(String),
+
+    // --- Command Errors ---
+    #[error("Start error: {0}")]
+    Start(String),
 
     // --- Catch-all Dynamic Error Wrapper ---
     #[error(transparent)]

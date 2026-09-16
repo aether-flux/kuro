@@ -1,4 +1,5 @@
 use std::{
+    ffi::CString,
     fs::File,
     io::Write,
     os::fd::AsFd,
@@ -12,12 +13,12 @@ use crate::{
     container::state::{ContainerState, ContainerStatus},
     error::{KuroError, Result},
     namespaces::{mount::MountMgr, netns::NetMgr, security::SecMgr, userns::UserMgr},
-    sync::pipe::SyncPipe,
+    sync::{fifo::ExecFifo, pipe::SyncPipe},
 };
 use nix::{
     sched::{CloneFlags, clone, setns},
     sys::signal::Signal,
-    unistd::{Pid, sethostname},
+    unistd::{Pid, execve, sethostname},
 };
 use oci_spec::runtime::{Hook, LinuxNamespaceType, Spec};
 
@@ -43,8 +44,8 @@ impl<'a> CBuilder<'a> {
     }
 
     /// Run lifecycle hooks
-    pub fn run_hook(&self, hook: &str) -> Result<()> {
-        if let Some(hooks) = self.spec.hooks() {
+    pub fn run_hook(spec: &'a Spec, container_id: &str, hook: &str) -> Result<()> {
+        if let Some(hooks) = spec.hooks() {
             let hook_list = match hook {
                 "prestart" => hooks.prestart().as_deref(),
                 "createRuntime" => hooks.create_runtime().as_deref(),
@@ -56,7 +57,7 @@ impl<'a> CBuilder<'a> {
             };
 
             if let Some(list) = hook_list {
-                let state = ContainerState::load(&self.container_id)?;
+                let state = ContainerState::load(&container_id)?;
                 let state_json = serde_json::to_string(&state).map_err(|e| {
                     KuroError::Hook(format!("Failed to serialize container state: {}", e))
                 })?;
@@ -71,10 +72,11 @@ impl<'a> CBuilder<'a> {
     }
 
     /// Create container
-    pub fn create(&mut self) -> Result<Pid> {
+    pub fn create(&mut self) -> Result<(Pid, SyncPipe)> {
         // Create sync pipes
         let parent_to_child = SyncPipe::new()?;
         let child_to_parent = SyncPipe::new()?;
+        let start_pipe = SyncPipe::new()?;
 
         // Get clone flags
         let clone_flags = self.get_clone_flags()?;
@@ -84,7 +86,7 @@ impl<'a> CBuilder<'a> {
 
         // Closure executed in child process
         let child_fn = Box::new(|| -> isize {
-            match self.run_child_init(&child_to_parent, &parent_to_child) {
+            match self.run_child_init(&child_to_parent, &parent_to_child, &start_pipe) {
                 Ok(_) => 0,
                 Err(e) => {
                     eprintln!("[kuro-child] Error during initialization: {}", e);
@@ -128,9 +130,6 @@ impl<'a> CBuilder<'a> {
         }
         cmgr.add_proc(child_pid)?;
 
-        // Network setup
-        // NetMgr::setup_network(child_pid, None)?;
-
         // Update and save state (status = Created)
         let mut state = ContainerState::load(&self.container_id)?;
         state.status = ContainerStatus::Created;
@@ -151,8 +150,8 @@ impl<'a> CBuilder<'a> {
         child_to_parent.wait_for_signal()?;
 
         // Child setup completed; can run hooks now
-        self.run_hook("prestart")?;
-        self.run_hook("createRuntime")?;
+        Self::run_hook(&self.spec, &self.container_id, "prestart")?;
+        Self::run_hook(&self.spec, &self.container_id, "createRuntime")?;
 
         // Signal child that parent has run hooks
         parent_to_child.send_signal()?;
@@ -160,11 +159,69 @@ impl<'a> CBuilder<'a> {
         // Wait for child to run their hooks
         child_to_parent.wait_for_signal()?;
 
-        Ok(child_pid)
+        Ok((child_pid, start_pipe))
+    }
+
+    /// Start container
+    pub fn start(spec: &'a Spec) -> Result<()> {
+        let proc = spec
+            .process()
+            .as_ref()
+            .ok_or_else(|| KuroError::InvalidSpec("Missing 'process' field in spec".to_string()))?;
+        let args = proc.args().as_ref().ok_or_else(|| {
+            KuroError::InvalidSpec("Missing 'process.args' field in spec".to_string())
+        })?;
+        if args.is_empty() {
+            return Err(KuroError::InvalidSpec(
+                "process.args cannot be empty".to_string(),
+            ));
+        }
+
+        // Convert process.args into executable path CString
+        let path = CString::new(args[0].as_str())
+            .map_err(|e| KuroError::ExecFailed(format!("Failed to create CString: {}", e)))?;
+
+        // Convert full process.args to CString array
+        let argv: Vec<CString> = args
+            .iter()
+            .map(|arg| {
+                CString::new(arg.as_str())
+                    .map_err(|e| KuroError::ExecFailed(format!("Failed to create CString: {}", e)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Convert process.env to CString vector
+        let env_spec = proc.env().as_deref().unwrap_or(&[]);
+        let envp: Vec<CString> = env_spec
+            .iter()
+            .map(|env| {
+                CString::new(env.as_str())
+                    .map_err(|e| KuroError::ExecFailed(format!("Failed to create CString: {}", e)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Drop privileges finally
+        SecMgr::setup_security(&spec)?;
+        if let Some(linux) = spec.linux() {
+            if let Some(seccomp) = linux.seccomp() {
+                SecMgr::apply_seccomp(&seccomp)?;
+            }
+        }
+
+        // Call execve
+        execve(&path, &argv, &envp)
+            .map_err(|e| KuroError::ExecFailed(format!("execve failed for {}: {}", args[0], e)))?;
+
+        Ok(())
     }
 
     /// Child container execution (Level 2)
-    fn run_child_init(&self, child_to_parent: &SyncPipe, parent_to_child: &SyncPipe) -> Result<()> {
+    fn run_child_init(
+        &self,
+        child_to_parent: &SyncPipe,
+        parent_to_child: &SyncPipe,
+        start_pipe: &SyncPipe,
+    ) -> Result<()> {
         // Wait for host to complete setup
         parent_to_child.wait_for_signal()?;
 
@@ -200,25 +257,18 @@ impl<'a> CBuilder<'a> {
         parent_to_child.wait_for_signal()?;
 
         // Parent has run hooks, now child will run hook
-        self.run_hook("createContainer")?;
-
-        // Setup capabilities, rlimits, env vars, and no_new_privs
-        SecMgr::setup_security(&self.spec)?;
-        if let Some(linux) = self.spec.linux() {
-            if let Some(seccomp) = linux.seccomp() {
-                SecMgr::apply_seccomp(&seccomp)?;
-            }
-        }
+        Self::run_hook(&self.spec, &self.container_id, "createContainer")?;
 
         // Signal parent that child is ready and paused
         child_to_parent.send_signal()?;
 
-        // TODO: Pause for 'kuro start' signal
-        // [for now, we simulate the pause with a looped sleep]
-        println!("[kuro-child] Container initialized and paused, ready to start");
-        loop {
-            std::thread::sleep(Duration::from_secs(3600));
-        }
+        // [x]   Pause for 'kuro start' signal
+        println!("[kuro] Container initialized and paused, ready to start");
+        start_pipe.wait_for_signal()?;
+
+        // Unblocked -> Call start method
+        Self::run_hook(&self.spec, &self.container_id, "startContainer")?;
+        Self::start(&self.spec)?;
 
         Ok(())
     }
