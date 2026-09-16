@@ -27,7 +27,7 @@ pub struct ContainerState {
 }
 
 impl ContainerState {
-    // Get root state directory (root vs rootless modes)
+    /// Get root state directory (root vs rootless modes)
     pub fn get_state_dir(container_id: &str) -> PathBuf {
         let uid = unsafe { libc::geteuid() };
         let base_run = if uid == 0 {
@@ -44,12 +44,12 @@ impl ContainerState {
         base_run.join(container_id)
     }
 
-    // Get state persistence file path
+    /// Get state persistence file path
     pub fn get_state_file(container_id: &str) -> PathBuf {
         Self::get_state_dir(container_id).join("state.json")
     }
 
-    // Save current contents to file
+    /// Save current contents to file
     pub fn save(&self) -> Result<()> {
         let dir = Self::get_state_dir(&self.id);
         fs::create_dir_all(&dir)?;
@@ -58,7 +58,7 @@ impl ContainerState {
         Ok(())
     }
 
-    // Load contents of state file to struct
+    /// Load contents of state file to struct
     pub fn load(container_id: &str) -> Result<Self> {
         // Check if state file exists
         let path = Self::get_state_file(container_id);
@@ -78,6 +78,7 @@ impl ContainerState {
                 // signal None (0) checks if process exists without sending any signal
                 if kill(Pid::from_raw(state.pid), None).is_err() {
                     state.status = ContainerStatus::Stopped;
+                    let _ = state.save();
                 }
             }
         }
@@ -85,7 +86,7 @@ impl ContainerState {
         Ok(state)
     }
 
-    // Cleanup state file
+    /// Cleanup state file
     pub fn destroy(container_id: &str) -> Result<()> {
         let dir = Self::get_state_dir(container_id);
         if dir.exists() {

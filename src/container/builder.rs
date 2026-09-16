@@ -11,6 +11,7 @@ use std::{
 use crate::{
     cgroups::v2::CgroupMgr,
     container::state::{ContainerState, ContainerStatus},
+    devices::{devices::DevMgr, terminal::TermMgr},
     error::{KuroError, Result},
     namespaces::{mount::MountMgr, netns::NetMgr, security::SecMgr, userns::UserMgr},
     sync::{fifo::ExecFifo, pipe::SyncPipe},
@@ -72,11 +73,10 @@ impl<'a> CBuilder<'a> {
     }
 
     /// Create container
-    pub fn create(&mut self) -> Result<(Pid, SyncPipe)> {
+    pub fn create(&mut self) -> Result<Pid> {
         // Create sync pipes
         let parent_to_child = SyncPipe::new()?;
         let child_to_parent = SyncPipe::new()?;
-        let start_pipe = SyncPipe::new()?;
 
         // Get clone flags
         let clone_flags = self.get_clone_flags()?;
@@ -86,7 +86,7 @@ impl<'a> CBuilder<'a> {
 
         // Closure executed in child process
         let child_fn = Box::new(|| -> isize {
-            match self.run_child_init(&child_to_parent, &parent_to_child, &start_pipe) {
+            match self.run_child_init(&child_to_parent, &parent_to_child) {
                 Ok(_) => 0,
                 Err(e) => {
                     eprintln!("[kuro-child] Error during initialization: {}", e);
@@ -159,7 +159,7 @@ impl<'a> CBuilder<'a> {
         // Wait for child to run their hooks
         child_to_parent.wait_for_signal()?;
 
-        Ok((child_pid, start_pipe))
+        Ok(child_pid)
     }
 
     /// Start container
@@ -216,14 +216,14 @@ impl<'a> CBuilder<'a> {
     }
 
     /// Child container execution (Level 2)
-    fn run_child_init(
-        &self,
-        child_to_parent: &SyncPipe,
-        parent_to_child: &SyncPipe,
-        start_pipe: &SyncPipe,
-    ) -> Result<()> {
+    fn run_child_init(&self, child_to_parent: &SyncPipe, parent_to_child: &SyncPipe) -> Result<()> {
         // Wait for host to complete setup
         parent_to_child.wait_for_signal()?;
+
+        // Open FIFO pipe file and acquire file descriptor
+        let state_dir = ContainerState::get_state_dir(&self.container_id);
+        let fifo_path = ExecFifo::init(&state_dir)?;
+        let fifo = ExecFifo::open_for_read(&fifo_path)?;
 
         // Handle all namespaces
         if let Some(linux) = self.spec.linux() {
@@ -243,6 +243,33 @@ impl<'a> CBuilder<'a> {
 
         // Setup mounts, pivot_root, and masked/readonly paths
         MountMgr::setup_mount(self.spec, &self.container_id, &self.bundle_path)?;
+
+        // Create device nodes and symlinks
+        let dev_spec = self
+            .spec
+            .linux()
+            .as_ref()
+            .and_then(|l| l.devices().as_deref());
+        DevMgr::create_devices(dev_spec)?;
+
+        // Apply device cgroup rules
+        if let Some(linux) = self.spec.linux() {
+            if let Some(rsrcs) = linux.resources() {
+                if let Some(dev_rules) = rsrcs.devices() {
+                    let cgroup_path = PathBuf::from("/sys/fs/cgroup/kuro").join(&self.container_id);
+                    CgroupMgr::apply_device_rules(&cgroup_path, dev_rules)?;
+                }
+            }
+        }
+
+        // Handle interactive terminal (PTY)
+        let interactive = self
+            .spec
+            .process()
+            .as_ref()
+            .and_then(|p| p.terminal())
+            .unwrap_or(false);
+        let _master_fd = TermMgr::setup_terminal(interactive)?;
 
         // [x]   Setup hostname
         // [x]   Mount filesystems and pivot_root
@@ -264,7 +291,7 @@ impl<'a> CBuilder<'a> {
 
         // [x]   Pause for 'kuro start' signal
         println!("[kuro] Container initialized and paused, ready to start");
-        start_pipe.wait_for_signal()?;
+        ExecFifo::wait_for_start(fifo)?;
 
         // Unblocked -> Call start method
         Self::run_hook(&self.spec, &self.container_id, "startContainer")?;

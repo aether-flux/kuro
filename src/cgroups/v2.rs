@@ -1,6 +1,9 @@
 use crate::error::{KuroError, Result};
-use oci_spec::runtime::LinuxResources;
-use std::path::{Path, PathBuf};
+use oci_spec::runtime::{LinuxDeviceCgroup, LinuxResources};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 pub struct CgroupMgr {
     path: PathBuf,
@@ -136,24 +139,32 @@ impl CgroupMgr {
         Ok(())
     }
 
-    /// Freeze all processes
-    pub fn freeze(&self) -> Result<()> {
-        std::fs::write(self.path.join("cgroup.freeze"), "1")
-            .map_err(|e| KuroError::Cgroup(format!("Failed to freeze cgroup: {}", e)))
-    }
-
-    /// Unfreeze all processes
-    pub fn unfreeze(&self) -> Result<()> {
-        std::fs::write(self.path.join("cgroup.freeze"), "0")
-            .map_err(|e| KuroError::Cgroup(format!("Failed to unfreeze cgroup: {}", e)))
-    }
-
     /// Clean up cgroup
     pub fn destroy(&self) -> Result<()> {
         if self.path.exists() {
             std::fs::remove_dir(&self.path).map_err(|e| {
                 KuroError::Cgroup(format!("Failed to remove cgroup directory: {}", e))
             })?;
+        }
+
+        Ok(())
+    }
+
+    /// Apply device filters
+    pub fn apply_device_rules(cgroup_path: &Path, rules: &[LinuxDeviceCgroup]) -> Result<()> {
+        for rule in rules {
+            let allow_str = format!(
+                "{} {}:{} {}",
+                if rule.allow() { "a" } else { "b" },
+                rule.major().map_or("".to_string(), |m| m.to_string()),
+                rule.minor().map_or("".to_string(), |m| m.to_string()),
+                rule.access().as_deref().unwrap_or("rwm")
+            );
+
+            let dev_file = cgroup_path.join("devices.allow");
+            if dev_file.exists() {
+                let _ = fs::write(dev_file, allow_str);
+            }
         }
 
         Ok(())

@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, str::FromStr};
+
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
 
 use crate::{
     cli::commands::{CliArgs, Commands},
@@ -13,8 +18,6 @@ use crate::{
 };
 
 pub fn handle_commands(args: &CliArgs) -> Result<()> {
-    let mut spipe: Option<SyncPipe> = None;
-
     match &args.command {
         // --- OCI-Compliant Mandatory Commands ---
         // // Create
@@ -81,14 +84,11 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
             // Run container builder
             let mut builder = CBuilder::new(container_id.to_owned(), bundle_path, &spec);
             match builder.create() {
-                Ok((pid, start_pipe)) => {
-                    println!(
-                        "[kuro] Container {} created successfully with PID {}",
-                        container_id,
-                        pid.to_string()
-                    );
-                    spipe = Some(start_pipe);
-                }
+                Ok(pid) => println!(
+                    "[kuro] Container {} created successfully with PID {}",
+                    container_id,
+                    pid.to_string()
+                ),
                 Err(e) => {
                     eprintln!("[kuro] {}", e);
                     ContainerCleanup::new(container_id.as_str(), builder.pid).cleanup()?;
@@ -109,26 +109,18 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
                     &container_id, state.status
                 )));
             }
-            if spipe.is_none() {
-                return Err(KuroError::Start(format!(
-                    "Container '{}' not created properly",
-                    &container_id
-                )));
-            }
 
             let spec = load_spec(&PathBuf::from(&state.bundle))?;
-            // TODO: Execute startContainer hooks (container)
-            // CBuilder::run_hook(&spec, &container_id, "startContainer");
 
             // Signal PID 1 to start container
-            // ExecFifo::signal_start(&state_dir)?;
-            spipe.unwrap().send_signal()?;
+            let state_dir = ContainerState::get_state_dir(&container_id);
+            ExecFifo::signal_start(&state_dir)?;
 
             // Update status -> Running
             state.status = ContainerStatus::Running;
             state.save()?;
 
-            // TODO: Execute poststart hooks (runtime)
+            // [x]   Execute poststart hooks (runtime)
             CBuilder::run_hook(&spec, &container_id, "poststart")?;
 
             println!("Started container {}...", container_id);
@@ -148,11 +140,32 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
             signal,
         } => {
             validate_id(&container_id)?;
-            if signal.trim().is_empty() {
-                return Err(KuroError::InvalidArgs("signal cannot be empty".to_string()));
+
+            let sig_str = if signal.trim().is_empty() {
+                "SIGTERM"
+            } else {
+                signal.as_str()
+            };
+            let sig = parse_signal(sig_str)?;
+            let state = ContainerState::load(&container_id)?;
+
+            if state.status == ContainerStatus::Stopped {
+                return Err(KuroError::InvalidArgs(format!(
+                    "Container '{}' is already stopped",
+                    &container_id
+                )));
             }
 
-            println!("Sending signal {} to container {}", signal, container_id);
+            let pid = Pid::from_raw(state.pid);
+
+            kill(pid, sig).map_err(|e| {
+                KuroError::ExecFailed(format!(
+                    "Failed to send signal {:?} to PID {}: {}",
+                    sig, pid, e
+                ))
+            })?;
+
+            println!("[kuro] Signal {:?} sent to container {}", sig, container_id);
         }
 
         // // Delete
@@ -181,4 +194,23 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+// Parse signal string to Signal variant
+fn parse_signal(sig: &str) -> Result<Signal> {
+    let sig_upper = sig.trim().to_uppercase();
+
+    let normalized = if sig_upper.parse::<i32>().is_ok() {
+        let num: i32 = sig_upper.parse().unwrap();
+        Signal::try_from(num)
+            .map_err(|_| KuroError::InvalidArgs(format!("Invalid signal number: {}", num)))?
+    } else if sig_upper.starts_with("SIG") {
+        Signal::from_str(&sig_upper)
+            .map_err(|_| KuroError::InvalidArgs(format!("Invalid signal name: {}", sig)))?
+    } else {
+        Signal::from_str(&format!("SIG{}", sig_upper))
+            .map_err(|_| KuroError::InvalidArgs(format!("Invalid signal name: {}", sig)))?
+    };
+
+    Ok(normalized)
 }

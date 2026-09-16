@@ -9,6 +9,7 @@ mod cgroups;
 mod cli;
 mod config;
 mod container;
+mod devices;
 mod error;
 mod namespaces;
 mod sync;
