@@ -8,8 +8,8 @@
 
 ### Logs
 ```sh
-[kuro-host] Spawned container init process with PID: 31012
-[kuro-child] Error during initialization: Mount error: Failed to unmount /old_root: EINVAL: Invalid argument
+[kuro-host] Spawned container init process with PID: 6553
+[kuro] Error during initialization: Mount failed for target '/dev': EINVAL: Invalid argument
 ```
 
 ## Run 2
@@ -29,3 +29,29 @@
   "annotations": {}
 }
 ```
+
+## Run 4
+
+### Test Env
+- Rootfs: ./alpinefs/
+- Command: kuro create alp-test ./alpinefs
+
+### Logs
+```sh
+[kuro-host] Spawned container init process with PID: 13518
+[kuro] Error during initialization: Mount failed for target '/dev': EINVAL: Invalid argument
+[kuro] Command execution failed: Child initialization failed: Mount failed for target '/dev': EINVAL: Invalid argument
+[kuro] Cleaning up container 'alp-test'...
+[kuro] WARN: Failed to remove cgroup path "/sys/fs/cgroup/kuro/alp-test": Device or resource busy (os error 16)
+Error: ExecFailed("Child initialization failed: Mount failed for target '/dev': EINVAL: Invalid argument")
+```
+
+#### Insights
+- Mount error, not able to mount /dev device with EINVAL
+
+
+# Fixed Bugs
+- Cleanup kills every single process
+- EPERM mount, invalid "/old_root" (replaced "." with &root)
+- Container state being "created" even though it wasn't
+- Child hangs on setup error because parent keeps listening for signal that'll never arrive

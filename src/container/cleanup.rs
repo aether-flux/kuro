@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf};
 
 use nix::{
     sys::signal::{Signal, kill},
-    unistd::Pid,
+    unistd::{Pid, getpid},
 };
 
 use crate::{container::state::ContainerState, error::Result};
@@ -34,9 +34,19 @@ impl ContainerCleanup {
 
         // Force kill child processes if alive
         if let Some(pid_raw) = self.pid {
-            let pid = Pid::from_raw(pid_raw);
-            // Send SIGKILL; ignore ESRCH error (process already dead)
-            let _ = kill(pid, Signal::SIGKILL);
+            let curpid = getpid().as_raw();
+
+            // If pid is 0 or -1, do not kill (container not properly created)
+            if pid_raw > 1 && pid_raw != curpid {
+                let pid = Pid::from_raw(pid_raw);
+                // Send SIGKILL; ignore ESRCH error (process already dead)
+                let _ = kill(pid, Signal::SIGKILL);
+            } else {
+                eprintln!(
+                    "[kuro] WARN: Skipping kill for invalid or dangerous PID: {}",
+                    pid_raw
+                );
+            }
         }
 
         // Remove cgroup directory

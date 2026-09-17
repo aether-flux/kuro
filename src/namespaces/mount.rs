@@ -109,7 +109,7 @@ impl MountMgr {
         let old_root = root.join("old_root");
         fs::create_dir_all(&old_root)?;
         // WARN: If bugs arise, change "." to &root
-        pivot_root(".", &old_root)
+        pivot_root(&root, &old_root)
             .map_err(|e| KuroError::Mount(format!("Failed to pivot root: {}", e)))?;
 
         // Clean up old root
@@ -145,7 +145,10 @@ impl MountMgr {
                 let source = mnt.source().as_deref();
                 let fstype = mnt.typ().as_deref();
 
-                mount(source, dest, fstype, flags, data)?;
+                mount(source, dest, fstype, flags, data).map_err(|e| KuroError::MountFailed {
+                    target: dest.to_string_lossy().to_string(),
+                    source: e,
+                })?;
             }
         }
 

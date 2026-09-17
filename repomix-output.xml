@@ -1,0 +1,2406 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+src/
+  cgroups/
+    mod.rs
+    v2.rs
+  cli/
+    commands.rs
+    handle.rs
+    mod.rs
+  config/
+    mod.rs
+    spec.rs
+  container/
+    builder.rs
+    cleanup.rs
+    mod.rs
+    state.rs
+  devices/
+    devices.rs
+    mod.rs
+    terminal.rs
+  namespaces/
+    mod.rs
+    mount.rs
+    netns.rs
+    security.rs
+    userns.rs
+  sync/
+    fifo.rs
+    mod.rs
+    pipe.rs
+  error.rs
+  main.rs
+.gitignore
+BUGS.md
+Cargo.toml
+DOC.md
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="DOC.md">
+### &Option<_>
+- &Option<> is bad. Its lifetime gets over when the line getting that value is done executing.
+- Fix: Use .as_ref() to convert &Option<_> into Option<&_>.
+
+### uid/gid helpers
+- setuidmap/setgidmap: Helper binaries with necessary capabilities enabled (SETUID/SETGID)
+- setuid/setgid: When ran on unprivileged process, or going from root to dropping root privileges, sets all three (real, effective, saved set) uid/gid
+- setresuid/setresgid: Explicitly sets real, effective, saved set uid/gid
+
+### kill()
+- Sending kill signal to pid=0 sends signal to every process in the caller's process group
+- Sending kill signal to pid=-1 sends signal to every single process on the system that the user has permission to kill (so as sudo, every process ever)
+</file>
+
+<file path="src/cli/commands.rs">
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "kuro", about = "")]
+pub struct CliArgs {
+    #[command(subcommand)]
+    pub command: Commands,
+}
+
+#[derive(Subcommand)]
+pub enum Commands {
+    // --- OCI-COMPLIANT MANDATORY COMMANDS ---
+
+    // Create container
+    Create {
+        container_id: String,
+        bundle_path: String,
+    },
+
+    // Start container
+    Start {
+        container_id: String,
+    },
+
+    // Return container state
+    State {
+        container_id: String,
+    },
+
+    // Kill container
+    Kill {
+        container_id: String,
+        signal: String,
+    },
+
+    // Delete container
+    Delete {
+        container_id: String,
+    },
+}
+</file>
+
+<file path="src/cli/mod.rs">
+pub mod commands;
+pub mod handle;
+</file>
+
+<file path="src/config/spec.rs">
+use std::path::Path;
+
+use oci_spec::runtime::Spec;
+
+use crate::error::{KuroError, Result};
+
+pub fn load_spec(bundle: &Path) -> Result<Spec> {
+    let spec_path = bundle.join("config.json");
+    if !spec_path.is_file() {
+        return Err(KuroError::InvalidBundle {
+            path: spec_path,
+            reason: "Missing config.json in bundle directory".to_string(),
+        });
+    }
+
+    let spec = Spec::load(spec_path)?;
+
+    Ok(spec)
+}
+</file>
+
+<file path="src/container/cleanup.rs">
+use std::{fs, path::PathBuf};
+
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
+
+use crate::{container::state::ContainerState, error::Result};
+
+pub struct ContainerCleanup {
+    pub container_id: String,
+    pub pid: Option<i32>,
+    pub cgroup_path: PathBuf,
+    pub state_dir: PathBuf,
+}
+
+impl ContainerCleanup {
+    /// Create new cleaner instance
+    pub fn new(container_id: &str, pid: Option<i32>) -> Self {
+        let cgroup_path = PathBuf::from("/sys/fs/cgroup/kuro").join(&container_id);
+        let state_dir = ContainerState::get_state_dir(&container_id);
+
+        Self {
+            container_id: container_id.to_string(),
+            pid,
+            cgroup_path,
+            state_dir,
+        }
+    }
+
+    /// Cleanup process
+    pub fn cleanup(&self) -> Result<()> {
+        println!("[kuro] Cleaning up container '{}'...", self.container_id);
+
+        // Force kill child processes if alive
+        if let Some(pid_raw) = self.pid {
+            // If pid is 0 or -1, do not kill (container not properly created)
+            if pid_raw != 0 || pid_raw != -1 {
+                let pid = Pid::from_raw(pid_raw);
+                // Send SIGKILL; ignore ESRCH error (process already dead)
+                let _ = kill(pid, Signal::SIGKILL);
+            }
+        }
+
+        // Remove cgroup directory
+        if self.cgroup_path.exists() {
+            if let Err(e) = fs::remove_dir(&self.cgroup_path) {
+                eprintln!(
+                    "[kuro] WARN: Failed to remove cgroup path {:?}: {}",
+                    self.cgroup_path, e
+                );
+            }
+        }
+
+        // Remove state directory
+        if self.state_dir.exists() {
+            if let Err(e) = fs::remove_dir_all(&self.state_dir) {
+                eprintln!(
+                    "[kuro] WARN: Failed to remove state diirectory {:?}: {}",
+                    self.state_dir, e
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+</file>
+
+<file path="src/devices/devices.rs">
+use std::{
+    fs::{self, OpenOptions},
+    path::{Path, PathBuf},
+};
+
+use libc::dev_t;
+use nix::{
+    mount::{MsFlags, mount},
+    sys::stat::{Mode, SFlag, mknod},
+    unistd::{Gid, Uid, chown},
+};
+use oci_spec::runtime::{LinuxDevice, LinuxDeviceType};
+
+use crate::error::{KuroError, Result};
+
+pub struct DevMgr;
+
+impl DevMgr {
+    /// Default OCI container devices required by spec
+    fn default_devices() -> Vec<LinuxDevice> {
+        vec![
+            Self::make_dev("/dev/null", LinuxDeviceType::C, 1, 3, 0o666),
+            Self::make_dev("/dev/zero", LinuxDeviceType::C, 1, 5, 0o666),
+            Self::make_dev("/dev/full", LinuxDeviceType::C, 1, 7, 0o666),
+            Self::make_dev("/dev/random", LinuxDeviceType::C, 1, 8, 0o666),
+            Self::make_dev("/dev/urandom", LinuxDeviceType::C, 1, 9, 0o666),
+            Self::make_dev("/dev/tty", LinuxDeviceType::C, 5, 0, 0o666),
+            Self::make_dev("/dev/ptmx", LinuxDeviceType::C, 5, 2, 0o666),
+        ]
+    }
+
+    fn make_dev(
+        path: &str,
+        dev_type: LinuxDeviceType,
+        major: i64,
+        minor: i64,
+        file_mode: u32,
+    ) -> LinuxDevice {
+        let mut dev = LinuxDevice::default();
+        dev.set_path(PathBuf::from(path));
+        dev.set_typ(dev_type);
+        dev.set_major(major);
+        dev.set_minor(minor);
+        dev.set_file_mode(Some(file_mode));
+
+        dev
+    }
+
+    /// Create missing device nodes inside container rootfs
+    pub fn create_devices(dev_spec: Option<&[LinuxDevice]>) -> Result<()> {
+        let mut all_dev = Self::default_devices();
+        if let Some(extra) = dev_spec {
+            all_dev.extend_from_slice(extra);
+        }
+
+        for dev in all_dev {
+            let path = dev.path();
+            if path.exists() {
+                let _ = fs::remove_file(path);
+            }
+
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+
+            let sflag = match dev.typ() {
+                LinuxDeviceType::C => SFlag::S_IFCHR,
+                LinuxDeviceType::B => SFlag::S_IFBLK,
+                LinuxDeviceType::P => SFlag::S_IFIFO,
+                _ => SFlag::S_IFCHR,
+            };
+
+            let mode = Mode::from_bits_truncate(dev.file_mode().unwrap_or(0o600));
+            let rawdev = makedev(dev.major() as u64, dev.minor() as u64);
+
+            // Bind mount or mknod
+            if let Err(e) = mknod(path, sflag, mode, rawdev) {
+                if e == nix::errno::Errno::EPERM {
+                    Self::bind_dev_from_host(path)?;
+                } else {
+                    return Err(KuroError::ExecFailed(format!(
+                        "Failed to mknod device {:?}: {}",
+                        path, e
+                    )));
+                }
+            }
+
+            // Apply UID/GID if specified
+            if dev.uid().is_some() || dev.gid().is_some() {
+                let uid = dev.uid().map(Uid::from_raw);
+                let gid = dev.gid().map(Gid::from_raw);
+                let _ = chown(path, uid, gid);
+            }
+        }
+
+        // Setup standard symlinks
+        Self::setup_dev_symlinks()?;
+
+        Ok(())
+    }
+
+    /// Setup standard symlinks
+    fn setup_dev_symlinks() -> Result<()> {
+        let symlinks = [
+            ("/proc/self/fd", "/dev/fd"),
+            ("/proc/self/fd/0", "/dev/stdin"),
+            ("/proc/self/fd/1", "/dev/stdout"),
+            ("/proc/self/fd/2", "/dev/stderr"),
+            ("/dev/pts/ptmx", "/dev/ptmx"),
+        ];
+
+        for (target, link) in symlinks {
+            let link_path = Path::new(link);
+            if !link_path.exists() {
+                let _ = std::os::unix::fs::symlink(target, link_path);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Bind mount (fallback)
+    fn bind_dev_from_host(path: &Path) -> Result<()> {
+        let _ = OpenOptions::new().write(true).create(true).open(path);
+        mount(
+            Some(path),
+            path,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(|e| KuroError::MountFailed {
+            target: path.to_string_lossy().to_string(),
+            source: e,
+        })?;
+
+        Ok(())
+    }
+}
+
+fn makedev(major: u64, minor: u64) -> dev_t {
+    unsafe { libc::makedev(major as u32, minor as u32) }
+}
+</file>
+
+<file path="src/devices/mod.rs">
+pub mod devices;
+pub mod terminal;
+</file>
+
+<file path="src/devices/terminal.rs">
+use std::{
+    fs::{File, OpenOptions},
+    os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+};
+
+use nix::{
+    pty::{OpenptyResult, openpty},
+    unistd::{dup2, setsid},
+};
+
+use crate::error::{KuroError, Result};
+
+pub struct TermMgr;
+
+impl TermMgr {
+    /// Setup container IO depending on whether terminal is interactive (PTY) or not
+    pub fn setup_terminal(interactive: bool) -> Result<Option<File>> {
+        if interactive {
+            // Create PTY master/slave pair
+            let OpenptyResult { master, slave } = openpty(None, None)
+                .map_err(|e| KuroError::ExecFailed(format!("Failed to openpty: {}", e)))?;
+
+            setsid().map_err(|e| KuroError::ExecFailed(format!("Failed to setsid: {}", e)))?;
+
+            unsafe {
+                // TIOSCSTTY sets slave fd as the controlling terminal for this proc
+                if libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0) < 0 {
+                    return Err(KuroError::ExecFailed(
+                        "Failed to set controlling terminal (TIOCSCTTY)".to_string(),
+                    ));
+                }
+            }
+
+            // Duplicate slave to stdin(fd0) stdout(fd1) stderr(fd2)
+            unsafe {
+                let slave_fd = slave.as_fd();
+                dup2(slave_fd, &mut OwnedFd::from_raw_fd(0.as_raw_fd()))
+                    .map_err(|e| KuroError::ExecFailed(format!("dup2 stdin failed: {}", e)))?;
+                dup2(slave_fd, &mut OwnedFd::from_raw_fd(1.as_raw_fd()))
+                    .map_err(|e| KuroError::ExecFailed(format!("dup2 stdout failed: {}", e)))?;
+                dup2(slave_fd, &mut OwnedFd::from_raw_fd(2.as_raw_fd()))
+                    .map_err(|e| KuroError::ExecFailed(format!("dup2 stderr failed: {}", e)))?;
+            }
+
+            // Return master fd so host can relay it to CLI IO
+            let master_file = unsafe { File::from_raw_fd(master.into_raw_fd()) };
+            Ok(Some(master_file))
+        } else {
+            // Non-interactive; ensure standard stream descriptors are valid
+            Self::ensure_std_descriptors()?;
+            Ok(None)
+        }
+    }
+
+    fn ensure_std_descriptors() -> Result<()> {
+        for fd in 0..=2 {
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+                let dev_null = OpenOptions::new()
+                    .read(fd == 0)
+                    .write(fd != 0)
+                    .open("/dev/null")
+                    .map_err(|e| {
+                        KuroError::ExecFailed(format!("Failed to open /dev/null: {}", e))
+                    })?;
+                unsafe {
+                    dup2(dev_null.as_fd(), &mut OwnedFd::from_raw_fd(fd.as_raw_fd())).map_err(
+                        |e| KuroError::ExecFailed(format!("dup2 to /dev/null failed: {}", e)),
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+</file>
+
+<file path="src/sync/pipe.rs">
+use std::os::fd::{AsFd, OwnedFd};
+
+use nix::{
+    fcntl::OFlag,
+    unistd::{pipe2, read, write},
+};
+
+use crate::error::{KuroError, Result};
+
+/// Bi-directional sync pipe for host <-> container
+pub struct SyncPipe {
+    read_fd: OwnedFd,
+    write_fd: OwnedFd,
+}
+
+impl SyncPipe {
+    /// Create new pipe with O_CLOEXEC (automatically closed on execve)
+    pub fn new() -> Result<Self> {
+        let (read_fd, write_fd) = pipe2(OFlag::O_CLOEXEC)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to create pipe: {}", e)))?;
+
+        Ok(Self { read_fd, write_fd })
+    }
+
+    /// Send a 1-byte signal
+    pub fn send_signal(&self) -> Result<()> {
+        let buf = [1u8];
+        write(self.write_fd.as_fd(), &buf)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to send sync signal: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Wait until a 1-byte signal is received
+    pub fn wait_for_signal(&self) -> Result<()> {
+        let mut buf = [0u8; 1];
+        let bytes_read = read(self.read_fd.as_fd(), &mut buf)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to read sync signal: {}", e)))?;
+
+        if bytes_read == 0 {
+            return Err(KuroError::SyncPipe(
+                "Sync pipe closed unexpectedly before receiving signal".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+</file>
+
+<file path="BUGS.md">
+# Initial Run (Sep 16, 2026)
+
+## Run 1
+
+### Test Environment
+- Rootfs: local `./alpinefs/`
+- Command: `kuro create alp-test ./alpinefs`
+
+### Logs
+```sh
+[kuro-host] Spawned container init process with PID: 31012
+[kuro-child] Error during initialization: Mount error: Failed to unmount /old_root: EINVAL: Invalid argument
+```
+
+## Run 2
+
+### Test Environment
+- Rootfs: `./alpinefs/`
+- Command: `kuro state alp-test`
+
+### Logs
+```sh
+{
+  "ociVersion": "1.3.0",
+  "id": "alp-test",
+  "status": "created",
+  "pid": -1,
+  "bundle": "/home/aether/Projects/kuro/alpinefs",
+  "annotations": {}
+}
+```
+
+## Run 3
+
+### Test Env
+- Rootfs: ./alpinefs/
+- Command: kuro delete alp-test
+
+### Output
+Crashes the entire fking system. Crashed all processes, turned off my hyprland session, logged me out, and took me back to the login screen sddm.
+
+#### Insights
+- Status is created, but it hasn't setup properly. Probably order of updating state in create() is messed up.
+- Check about how I solved EINVAL error before during mini-runtime build.
+- pivot_root() has "." currently, try changing it to `&root` or `&rootfs` (whatever the variable name)
+</file>
+
+<file path="src/cgroups/mod.rs">
+pub mod v2;
+</file>
+
+<file path="src/cgroups/v2.rs">
+use crate::error::{KuroError, Result};
+use oci_spec::runtime::{LinuxDeviceCgroup, LinuxResources};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+pub struct CgroupMgr {
+    path: PathBuf,
+}
+
+impl CgroupMgr {
+    /// Setup new container cgroup
+    pub fn new(container_id: &str) -> Result<Self> {
+        let root_path = PathBuf::from("/sys/fs/cgroup");
+        let base_path = root_path.join("kuro");
+
+        if !base_path.exists() {
+            std::fs::create_dir_all(&base_path).map_err(|e| {
+                KuroError::Cgroup(format!("Failed to create base cgroup dir: {}", e))
+            })?;
+        }
+
+        // Enable controllers dynamically
+        Self::enable_controllers(&root_path, &base_path)?;
+
+        let path = base_path.join(container_id);
+        std::fs::create_dir_all(&path).map_err(|e| {
+            KuroError::Cgroup(format!("Failed to create container cgroup dir: {}", e))
+        })?;
+
+        Ok(Self { path })
+    }
+
+    /// Enable controllers
+    fn enable_controllers(parent: &Path, target_dir: &Path) -> Result<()> {
+        let ctrl_file = parent.join("cgroup.controllers");
+        // Fallback if system doesn't support full cgroups v2
+        if !ctrl_file.exists() {
+            return Ok(());
+        }
+
+        let available = std::fs::read_to_string(&ctrl_file).map_err(|e| {
+            KuroError::Cgroup(format!("Failed to read available controllers: {}", e))
+        })?;
+
+        let subtree_cmd = available
+            .split_whitespace()
+            .map(|c| format!("+{}", c))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if !subtree_cmd.is_empty() {
+            // Ignore errors if enabled/busy
+            let _ = std::fs::write(target_dir.join("cgroup.subtree_control"), subtree_cmd);
+        }
+
+        Ok(())
+    }
+
+    /// Add process to cgroup
+    pub fn add_proc(&self, pid: nix::unistd::Pid) -> Result<()> {
+        std::fs::write(self.path.join("cgroup.procs"), pid.to_string())
+            .map_err(|e| KuroError::Cgroup(format!("Failed to add pid {} to cgroup: {}", pid, e)))
+    }
+
+    /// Apply resource limits
+    pub fn apply_limits(&self, resources: &LinuxResources) -> Result<()> {
+        // Memory limits
+        if let Some(mem) = resources.memory() {
+            if let Some(limit) = mem.limit() {
+                let val = if limit < 0 {
+                    "max".to_string()
+                } else {
+                    limit.to_string()
+                };
+                std::fs::write(self.path.join("memory.max"), val)
+                    .map_err(|e| KuroError::Cgroup(format!("Failed to write memory.max: {}", e)))?;
+            }
+
+            if let Some(swap) = mem.swap() {
+                let val = if swap < 0 {
+                    "max".to_string()
+                } else {
+                    swap.to_string()
+                };
+                std::fs::write(self.path.join("memory.swap.max"), val).map_err(|e| {
+                    KuroError::Cgroup(format!("Failed to write memory.swap.max: {}", e))
+                })?;
+            }
+        }
+
+        // Pid limits
+        if let Some(pids) = resources.pids() {
+            let val = if pids.limit() <= 0 {
+                "max".to_string()
+            } else {
+                pids.limit().to_string()
+            };
+            std::fs::write(self.path.join("pids.max"), val)
+                .map_err(|e| KuroError::Cgroup(format!("Failed to write pids.max: {}", e)))?;
+        }
+
+        // CPU limits
+        if let Some(cpu) = resources.cpu() {
+            if let (Some(quota), Some(period)) = (cpu.quota(), cpu.period()) {
+                let quota_str = if quota < 0 {
+                    "max".to_string()
+                } else {
+                    quota.to_string()
+                };
+                let val = format!("{} {}", quota_str, period);
+                std::fs::write(self.path.join("cpu.max"), val)
+                    .map_err(|e| KuroError::Cgroup(format!("Failed to write cpu.max: {}", e)))?;
+            }
+
+            if let Some(shares) = cpu.shares() {
+                let weight = 1 + (shares.saturating_sub(2) * 9999) / 262142;
+                std::fs::write(self.path.join("cpu.weight"), weight.to_string())
+                    .map_err(|e| KuroError::Cgroup(format!("Failed to write cpu.weight: {}", e)))?;
+            }
+        }
+
+        // CPU Set limits
+        if let Some(cpuset) = resources.cpu() {
+            if let Some(cpus) = cpuset.cpus() {
+                std::fs::write(self.path.join("cpuset.cpus"), cpus).map_err(|e| {
+                    KuroError::Cgroup(format!("Failed to write cpuset.cpus: {}", e))
+                })?;
+            }
+
+            if let Some(mems) = cpuset.mems() {
+                std::fs::write(self.path.join("cpuset.mems"), mems).map_err(|e| {
+                    KuroError::Cgroup(format!("Failed to write cpuset.mems: {}", e))
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Clean up cgroup
+    pub fn destroy(&self) -> Result<()> {
+        if self.path.exists() {
+            std::fs::remove_dir(&self.path).map_err(|e| {
+                KuroError::Cgroup(format!("Failed to remove cgroup directory: {}", e))
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Apply device filters
+    pub fn apply_device_rules(cgroup_path: &Path, rules: &[LinuxDeviceCgroup]) -> Result<()> {
+        for rule in rules {
+            let allow_str = format!(
+                "{} {}:{} {}",
+                if rule.allow() { "a" } else { "b" },
+                rule.major().map_or("".to_string(), |m| m.to_string()),
+                rule.minor().map_or("".to_string(), |m| m.to_string()),
+                rule.access().as_deref().unwrap_or("rwm")
+            );
+
+            let dev_file = cgroup_path.join("devices.allow");
+            if dev_file.exists() {
+                let _ = fs::write(dev_file, allow_str);
+            }
+        }
+
+        Ok(())
+    }
+}
+</file>
+
+<file path="src/config/mod.rs">
+pub mod spec;
+</file>
+
+<file path="src/namespaces/mount.rs">
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use nix::{
+    mount::{MntFlags, MsFlags, mount, umount2},
+    unistd::{chdir, pivot_root},
+};
+use oci_spec::runtime::{Linux, Spec};
+
+use crate::error::{KuroError, Result};
+
+// [x]   Masked and readonly paths
+
+pub struct MountMgr;
+
+impl MountMgr {
+    /// Setup new mount namespace
+    pub fn setup_mount(spec: &Spec, container_id: &str, bundle: &PathBuf) -> Result<()> {
+        Self::setup_overlayfs(&spec, container_id, bundle)?;
+        Self::mount_fs(&spec)?;
+
+        if let Some(linux) = spec.linux() {
+            Self::set_masked(&linux)?;
+            Self::set_readonly(&linux)?;
+        }
+
+        Ok(())
+    }
+
+    /// Setup overlayfs
+    fn setup_overlayfs(spec: &Spec, container_id: &str, bundle: &PathBuf) -> Result<()> {
+        // Define dir paths
+        let base = bundle.join(container_id);
+        let upper = base.join("upper");
+        let work = base.join("work");
+        let merged = base.join("merged");
+        let lower = if let Some(rootfs) = spec.root().as_ref() {
+            bundle.join(rootfs.path())
+        } else {
+            bundle.join("rootfs")
+        };
+
+        // Create the directories
+        fs::create_dir_all(&upper)?;
+        fs::create_dir_all(&merged)?;
+        fs::create_dir_all(&work)?;
+
+        // Make mount propagation PRIVATE to prevent mounts leaking to host
+        mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+            None::<&str>,
+        )
+        .map_err(|e| KuroError::MountFailed {
+            target: "/".to_string(),
+            source: e,
+        })?;
+
+        // Mount OverlayFS
+        let overlay_opts = format!(
+            "lowerdir={},upperdir={},workdir={}",
+            lower.display(),
+            upper.display(),
+            work.display()
+        );
+        mount(
+            Some("overlay"),
+            &merged,
+            Some("overlay"),
+            MsFlags::empty(),
+            Some(overlay_opts.as_str()),
+        )
+        .map_err(|e| KuroError::MountFailed {
+            target: "overlay".to_string(),
+            source: e,
+        })?;
+
+        // pivot_root into isolated mount space
+        Self::setup_pivot_root(&merged)?;
+
+        Ok(())
+    }
+
+    /// Setup pivot_root
+    fn setup_pivot_root(merged: &PathBuf) -> Result<()> {
+        // Get absolute path of root
+        let root = fs::canonicalize(&merged)?;
+        chdir(&root)
+            .map_err(|e| KuroError::Mount(format!("Failed to chdir to new root: {}", e)))?;
+
+        // Bind-mount root onto itself (pre-requisite for pivot_root)
+        mount(
+            Some(&root),
+            &root,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+            None::<&str>,
+        )
+        .map_err(|e| KuroError::MountFailed {
+            target: root.to_string_lossy().to_string(),
+            source: e,
+        })?;
+
+        // Handle old root safely
+        let old_root = root.join("old_root");
+        fs::create_dir_all(&old_root)?;
+        // WARN: If bugs arise, change "." to &root
+        pivot_root(&root, &old_root)
+            .map_err(|e| KuroError::Mount(format!("Failed to pivot root: {}", e)))?;
+
+        // Clean up old root
+        chdir("/")
+            .map_err(|e| KuroError::Mount(format!("Failed to change directory to '/': {}", e)))?;
+        umount2("/old_root", MntFlags::MNT_DETACH)
+            .map_err(|e| KuroError::Mount(format!("Failed to unmount /old_root: {}", e)))?;
+        fs::remove_dir("/old_root")?;
+
+        Ok(())
+    }
+
+    /// Mount filesystems given in config
+    fn mount_fs(spec: &Spec) -> Result<()> {
+        if let Some(mounts) = spec.mounts() {
+            for mnt in mounts {
+                // Ensure destination path
+                let dest = mnt.destination();
+                if !dest.exists() {
+                    fs::create_dir_all(&dest)?;
+                }
+
+                // Parse mount options
+                let opts = mnt.options().as_deref().unwrap_or(&[]);
+                let (flags, data) = Self::parse_mount_options(opts);
+                let data = if data.is_empty() {
+                    None
+                } else {
+                    Some(data.as_str())
+                };
+
+                // Convert OCI spec to syscall types
+                let source = mnt.source().as_deref();
+                let fstype = mnt.typ().as_deref();
+
+                mount(source, dest, fstype, flags, data)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Parse mount options in OCI spec
+    fn parse_mount_options(options: &[String]) -> (MsFlags, String) {
+        let mut flags = MsFlags::empty();
+        let mut data_opts = Vec::new();
+
+        for opt in options {
+            match opt.as_str() {
+                "ro" => flags.insert(MsFlags::MS_RDONLY),
+                "nosuid" => flags.insert(MsFlags::MS_NOSUID),
+                "nodev" => flags.insert(MsFlags::MS_NODEV),
+                "noexec" => flags.insert(MsFlags::MS_NOEXEC),
+                "bind" => flags.insert(MsFlags::MS_BIND),
+                "rbind" => {
+                    flags.insert(MsFlags::MS_BIND);
+                    flags.insert(MsFlags::MS_REC);
+                }
+                "rec" => flags.insert(MsFlags::MS_REC),
+                "remount" => flags.insert(MsFlags::MS_REMOUNT),
+                "private" => flags.insert(MsFlags::MS_PRIVATE),
+                "slave" => flags.insert(MsFlags::MS_SLAVE),
+                "shared" => flags.insert(MsFlags::MS_SHARED),
+                other => data_opts.push(other),
+            }
+        }
+
+        let data = data_opts.join(",");
+
+        (flags, data)
+    }
+
+    /// Set up readonly paths (RDONLY)
+    fn set_readonly(linux: &Linux) -> Result<()> {
+        if let Some(rdpaths) = linux.readonly_paths() {
+            for path in rdpaths {
+                // Mount as bind-mount
+                mount(
+                    Some(path.as_str()),
+                    path.as_str(),
+                    None::<&str>,
+                    MsFlags::MS_BIND | MsFlags::MS_REC,
+                    None::<&str>,
+                )
+                .map_err(|e| KuroError::MountFailed {
+                    target: path.to_owned(),
+                    source: e,
+                })?;
+                // Remount as read-only (RDONLY)
+                mount(
+                    None::<&str>,
+                    path.as_str(),
+                    None::<&str>,
+                    MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | MsFlags::MS_BIND | MsFlags::MS_REC,
+                    None::<&str>,
+                )
+                .map_err(|e| KuroError::MountFailed {
+                    target: path.to_owned(),
+                    source: e,
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Set up masked paths
+    fn set_masked(linux: &Linux) -> Result<()> {
+        if let Some(maskpaths) = linux.masked_paths() {
+            for path in maskpaths {
+                let path = Path::new(path);
+                if !path.exists() {
+                    continue;
+                }
+
+                if path.is_dir() {
+                    // If path is a directory, mask it over an empty read-only tmpfs directory
+                    mount(
+                        Some("tmpfs"),
+                        path,
+                        Some("tmpfs"),
+                        MsFlags::MS_RDONLY,
+                        Some("mode=000"),
+                    )
+                    .map_err(|e| KuroError::MountFailed {
+                        target: path.to_string_lossy().to_string(),
+                        source: e,
+                    })?;
+                } else {
+                    // If path is a file, bind-mount it over /dev/null
+                    mount(
+                        Some("/dev/null"),
+                        path,
+                        None::<&str>,
+                        MsFlags::MS_BIND,
+                        None::<&str>,
+                    )
+                    .map_err(|e| KuroError::MountFailed {
+                        target: path.to_string_lossy().to_string(),
+                        source: e,
+                    })?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+</file>
+
+<file path="src/namespaces/netns.rs">
+use std::{fs::File, os::fd::AsFd, path::Path, process::Command};
+
+use nix::{
+    sched::{CloneFlags, setns},
+    unistd::Pid,
+};
+
+use crate::error::{KuroError, Result};
+
+pub struct NetMgr;
+
+impl NetMgr {
+    /// Configure network interface inside child PID's network namespace
+    pub fn setup_network() -> Result<()> {
+        Self::bring_up_loopback()?;
+
+        Ok(())
+    }
+
+    /// Bring up loopback device in new namespace
+    fn bring_up_loopback() -> Result<()> {
+        let status = Command::new("ip")
+            .args(&["link", "set", "dev", "lo", "up"])
+            .status()?;
+
+        if !status.success() {
+            return Err(KuroError::Netns(
+                "Failed to bring up loopback device".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+</file>
+
+<file path="src/namespaces/userns.rs">
+use std::{fs, process::Command};
+
+use nix::unistd::{Pid, geteuid};
+use oci_spec::runtime::LinuxIdMapping;
+
+use crate::error::{KuroError, Result};
+
+pub struct UserMgr;
+
+impl UserMgr {
+    /// Writes UID and GID mappings
+    /// Detects root/rootless modes and works accordingly
+    pub fn set_mappings(
+        child_pid: Pid,
+        uid_mappings: Option<&[LinuxIdMapping]>,
+        gid_mappings: Option<&[LinuxIdMapping]>,
+    ) -> Result<()> {
+        let is_root = geteuid().is_root();
+
+        if let Some(uids) = uid_mappings {
+            if !uids.is_empty() {
+                Self::write_id_map(child_pid, "uid", uids, is_root)?;
+            }
+        }
+
+        if let Some(gids) = gid_mappings {
+            if !gids.is_empty() {
+                // Set setgroups to deny to write directly to /proc/<pid>/gid_map
+                if is_root {
+                    let setgroups_path = format!("/proc/{}/setgroups", child_pid);
+                    let _ = fs::write(setgroups_path, "deny");
+                }
+                Self::write_id_map(child_pid, "gid", gids, is_root)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write ID mappings
+    fn write_id_map(
+        child_pid: Pid,
+        map_type: &str,
+        mappings: &[LinuxIdMapping],
+        is_root: bool,
+    ) -> Result<()> {
+        if is_root {
+            // Root mode: Directly write to /proc
+            let map_file = format!("/proc/{}/{}_map", child_pid, map_type);
+            let mut content = String::new();
+            for m in mappings {
+                content.push_str(&format!(
+                    "{} {} {}\n",
+                    m.container_id(),
+                    m.host_id(),
+                    m.size()
+                ));
+            }
+
+            fs::write(&map_file, content)
+                .map_err(|e| KuroError::Userns(format!("Failed to write {}: {}", map_file, e)))?;
+        } else {
+            // Rootless mode: Use helpers newuidmap/newgidmap
+            let helper = format!("new{}map", map_type);
+            let mut cmd = Command::new(&helper);
+            cmd.arg(child_pid.to_string());
+
+            for m in mappings {
+                cmd.arg(m.container_id().to_string())
+                    .arg(m.host_id().to_string())
+                    .arg(m.size().to_string());
+            }
+
+            let status = cmd.status().map_err(|e| {
+                KuroError::Userns(format!("Failed to execute helper {}: {}", helper, e))
+            })?;
+
+            if !status.success() {
+                return Err(KuroError::Userns(format!(
+                    "{} helper failed with status {}",
+                    helper, status
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+</file>
+
+<file path="src/sync/fifo.rs">
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+};
+
+use libc::O_NONBLOCK;
+use nix::{sys::stat::Mode, unistd::mkfifo};
+
+use crate::error::{KuroError, Result};
+
+pub struct ExecFifo;
+
+impl ExecFifo {
+    /// Create FIFO path
+    pub fn create_path(container_dir: &Path) -> PathBuf {
+        container_dir.join("exec.fifo")
+    }
+
+    /// Create FIFO pipe
+    pub fn init(container_dir: &Path) -> Result<PathBuf> {
+        let path = Self::create_path(&container_dir);
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+
+        mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to create '{:?}': {}", &path, e)))?;
+        Ok(path)
+    }
+
+    /// Open file while host /run is available
+    pub fn open_for_read(fifo_path: &Path) -> Result<File> {
+        // File::open(&fifo_path)
+        //     .map_err(|e| KuroError::SyncPipe(format!("Failed to open '{:?}': {}", &fifo_path, e)))
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK)
+            .open(fifo_path)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to open '{:?}': {}", &fifo_path, e)))
+    }
+
+    /// Wait on already-opened file descriptor
+    pub fn wait_for_start(fifo_file: File) -> Result<()> {
+        // Clear O_NONBLOCK so read_exact() can now block
+        use std::os::unix::io::AsRawFd;
+        let fd = fifo_file.as_raw_fd();
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags & !O_NONBLOCK);
+        }
+
+        let mut fifo_file = fifo_file;
+        let mut buf = [0u8; 1];
+        fifo_file
+            .read_exact(&mut buf)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to read signal: {}", e)))?;
+        Ok(())
+    }
+
+    /// Send signal to child to unblock
+    pub fn signal_start(container_dir: &Path) -> Result<()> {
+        let path = Self::create_path(&container_dir);
+        let mut fifo = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to create '{:?}': {}", &path, e)))?;
+        fifo.write_all(&[1u8])
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to send signal: {}", e)))?;
+
+        Ok(())
+    }
+}
+</file>
+
+<file path="src/container/mod.rs">
+pub mod builder;
+pub mod cleanup;
+pub mod state;
+</file>
+
+<file path="src/container/state.rs">
+use std::{collections::HashMap, fs, path::PathBuf};
+
+use nix::{sys::signal::kill, unistd::Pid};
+use serde::{Deserialize, Serialize};
+
+use crate::error::{KuroError, Result};
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContainerStatus {
+    Creating,
+    Created,
+    Running,
+    Stopped,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerState {
+    pub oci_version: String,
+    pub id: String,
+    pub status: ContainerStatus,
+    pub pid: i32,
+    pub bundle: String,
+    #[serde(default)]
+    pub annotations: HashMap<String, String>,
+}
+
+impl ContainerState {
+    /// Get root state directory (root vs rootless modes)
+    pub fn get_state_dir(container_id: &str) -> PathBuf {
+        let uid = unsafe { libc::geteuid() };
+        let base_run = if uid == 0 {
+            // runtime dir for root user
+            PathBuf::from("/run/kuro")
+        } else {
+            // runtime dir per user
+            std::env::var("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from(format!("/run/user/{}", uid)))
+                .join("kuro")
+        };
+
+        base_run.join(container_id)
+    }
+
+    /// Get state persistence file path
+    pub fn get_state_file(container_id: &str) -> PathBuf {
+        Self::get_state_dir(container_id).join("state.json")
+    }
+
+    /// Save current contents to file
+    pub fn save(&self) -> Result<()> {
+        let dir = Self::get_state_dir(&self.id);
+        fs::create_dir_all(&dir)?;
+        let data = serde_json::to_string_pretty(self)?;
+        fs::write(Self::get_state_file(&self.id), data)?;
+        Ok(())
+    }
+
+    /// Load contents of state file to struct
+    pub fn load(container_id: &str) -> Result<Self> {
+        // Check if state file exists
+        let path = Self::get_state_file(container_id);
+        if !path.exists() {
+            return Err(KuroError::ContainerStateNotFound {
+                id: container_id.to_string(),
+            });
+        }
+
+        // Convert file contents into ContainerState object
+        let data = fs::read_to_string(path)?;
+        let mut state: ContainerState = serde_json::from_str(&data)?;
+
+        // Check if host PID is still alive
+        if state.status == ContainerStatus::Running || state.status == ContainerStatus::Created {
+            if state.pid > 0 {
+                // signal None (0) checks if process exists without sending any signal
+                if kill(Pid::from_raw(state.pid), None).is_err() {
+                    state.status = ContainerStatus::Stopped;
+                    let _ = state.save();
+                }
+            }
+        }
+
+        Ok(state)
+    }
+
+    /// Cleanup state file
+    pub fn destroy(container_id: &str) -> Result<()> {
+        let dir = Self::get_state_dir(container_id);
+        if dir.exists() {
+            fs::remove_dir_all(dir)?;
+        }
+
+        Ok(())
+    }
+}
+</file>
+
+<file path="src/namespaces/security.rs">
+use std::{collections::HashSet, env};
+
+use caps::{CapSet, Capability, CapsHashSet};
+use nix::{
+    sys::{
+        prctl::set_no_new_privs,
+        resource::{Resource, setrlimit},
+    },
+    unistd::{Gid, Uid, setgroups, setresgid, setresuid},
+};
+use oci_spec::runtime::{
+    LinuxCapabilities, LinuxSeccomp, LinuxSeccompAction, PosixRlimit, Spec, User,
+};
+use syscallz::{Action, Context, Syscall};
+
+use crate::error::{KuroError, Result};
+
+// [x]   Use syscallz crate and finish the method set_seccomp()
+
+pub struct SecMgr;
+
+impl SecMgr {
+    /// Setup all security features
+    pub fn setup_security(spec: &Spec) -> Result<()> {
+        if let Some(proc) = spec.process() {
+            // Set rlimits
+            if let Some(rlimits) = proc.rlimits() {
+                Self::set_rlimits(rlimits)?;
+            }
+
+            // Set no_new_privs
+            if let Some(val) = proc.no_new_privileges() {
+                Self::set_no_new_privs(val)?;
+            }
+
+            // Drop/set UID/GID
+            Self::set_user(proc.user())?;
+
+            // Set capabilities
+            if let Some(caps) = proc.capabilities() {
+                Self::set_caps(caps)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Setup capabilities
+    fn set_caps(cap_spec: &LinuxCapabilities) -> Result<()> {
+        // Helper to parse capability strings "CAP_SYS_ADMIN" or "SYS_ADMIN"
+        let parse_caps =
+            |caps_set: Option<&HashSet<oci_spec::runtime::Capability>>| -> CapsHashSet {
+                caps_set
+                    .map(|set| {
+                        set.iter()
+                            .filter_map(|c| {
+                                let cap_str = c.to_string();
+                                let name = cap_str.strip_prefix("CAP_").unwrap_or(&cap_str);
+                                name.parse::<Capability>().ok()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+
+        // Bounding capabilities
+        let bounding = parse_caps(cap_spec.bounding().as_ref());
+        caps::set(None, CapSet::Bounding, &bounding).map_err(|e| {
+            KuroError::Capability(format!("Error setting bounding capabilities: {}", e))
+        })?;
+
+        // Inheritable capabilities
+        let inheritable = parse_caps(cap_spec.inheritable().as_ref());
+        caps::set(None, CapSet::Inheritable, &inheritable).map_err(|e| {
+            KuroError::Capability(format!("Error setting inheritable capabilities: {}", e))
+        })?;
+
+        // Permitted capabilities
+        let permitted = parse_caps(cap_spec.permitted().as_ref());
+        caps::set(None, CapSet::Permitted, &permitted).map_err(|e| {
+            KuroError::Capability(format!("Error setting permitted capabilities: {}", e))
+        })?;
+
+        // Effective capabilities
+        let effective = parse_caps(cap_spec.effective().as_ref());
+        caps::set(None, CapSet::Effective, &effective).map_err(|e| {
+            KuroError::Capability(format!("Error setting effective capabilities: {}", e))
+        })?;
+
+        // Ambient capabilities
+        let ambient = parse_caps(cap_spec.ambient().as_ref());
+        if !ambient.is_empty() {
+            caps::set(None, CapSet::Ambient, &ambient).map_err(|e| {
+                KuroError::Capability(format!("Error setting ambient capabilities: {}", e))
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Set rlimits
+    fn set_rlimits(rlimits: &[PosixRlimit]) -> Result<()> {
+        for limit in rlimits {
+            let rsrc = match limit.typ().to_string().as_str() {
+                "RLIMIT_NOFILE" => Resource::RLIMIT_NOFILE,
+                "RLIMIT_NPROC" => Resource::RLIMIT_NPROC,
+                "RLIMIT_MEMLOCK" => Resource::RLIMIT_MEMLOCK,
+                "RLIMIT_CORE" => Resource::RLIMIT_CORE,
+                "RLIMIT_STACK" => Resource::RLIMIT_STACK,
+                "RLIMIT_AS" => Resource::RLIMIT_AS,
+                "RLIMIT_CPU" => Resource::RLIMIT_CPU,
+                "RLIMIT_FSIZE" => Resource::RLIMIT_FSIZE,
+                "RLIMIT_DATA" => Resource::RLIMIT_DATA,
+                "RLIMIT_LOCKS" => Resource::RLIMIT_LOCKS,
+                "RLIMIT_MSGQUEUE" => Resource::RLIMIT_MSGQUEUE,
+                "RLIMIT_NICE" => Resource::RLIMIT_NICE,
+                "RLIMIT_RSS" => Resource::RLIMIT_RSS,
+                "RLIMIT_RTPRIO" => Resource::RLIMIT_RTPRIO,
+                "RLIMIT_RTTIME" => Resource::RLIMIT_RTTIME,
+                "RLIMIT_SIGPENDING" => Resource::RLIMIT_SIGPENDING,
+                other => {
+                    eprintln!("Unknown rlimit type: {}", other);
+                    continue;
+                }
+            };
+
+            setrlimit(rsrc, limit.soft(), limit.hard()).map_err(|e| {
+                KuroError::Rlimits(format!(
+                    "Failed to set rlimit '{} {} {}': {}",
+                    limit.typ().to_string(),
+                    limit.soft(),
+                    limit.hard(),
+                    e
+                ))
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Set no_new_privileges
+    fn set_no_new_privs(val: bool) -> Result<()> {
+        if val {
+            set_no_new_privs()
+                .map_err(|e| KuroError::NoNewPrivs(format!("Error setting no_new_privs: {}", e)))?;
+        }
+
+        Ok(())
+    }
+
+    /// Set environment variables
+    fn set_env_vars(vars: &Vec<String>) -> Result<()> {
+        for var in vars {
+            if let Some((key, val)) = var.split_once('=') {
+                unsafe {
+                    env::set_var(key, val);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Set user/group
+    fn set_user(user: &User) -> Result<()> {
+        if let Some(gids) = user.additional_gids() {
+            let gids: Vec<Gid> = gids.iter().map(|&g| Gid::from_raw(g)).collect();
+            setgroups(&gids).map_err(|e| KuroError::Userns(format!("Failed setgroups: {}", e)))?;
+        }
+
+        let gid = Gid::from_raw(user.gid());
+        let uid = Uid::from_raw(user.uid());
+
+        setresgid(gid, gid, gid)
+            .map_err(|e| KuroError::Userns(format!("Failed setresgid: {}", e)))?;
+        setresuid(uid, uid, uid)
+            .map_err(|e| KuroError::Userns(format!("Failed setresuid: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Apply Seccomp filtering
+    pub fn apply_seccomp(seccomp_spec: &LinuxSeccomp) -> Result<()> {
+        let default_action = Self::map_seccomp(seccomp_spec.default_action())?;
+
+        // Initialize syscallz with default action
+        let mut ctx = Context::init_with_action(default_action).map_err(|e| {
+            KuroError::Seccomp(format!("Failed to initialize seccomp context: {}", e))
+        })?;
+
+        // Load syscall rules from config
+        if let Some(syscall_specs) = seccomp_spec.syscalls() {
+            for spec in syscall_specs {
+                let action = Self::map_seccomp(spec.action())?;
+
+                for name in spec.names() {
+                    if let Some(syscall) = Syscall::from_name(name) {
+                        ctx.set_action_for_syscall(action, syscall).map_err(|e| {
+                            KuroError::Seccomp(format!("Failed rule for '{}': {}", name, e))
+                        })?;
+                    } else {
+                        // Skip unknown syscalls
+                        eprintln!("WARN: Unknown syscall name in config: {}", name);
+                    }
+                }
+            }
+        }
+
+        ctx.load().map_err(|e| {
+            KuroError::Seccomp(format!("Failed to load seccomp filter into kernel: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    /// Map seccomp action to syscallz Action
+    fn map_seccomp(action: LinuxSeccompAction) -> Result<Action> {
+        let res = match action {
+            LinuxSeccompAction::ScmpActAllow => Action::Allow,
+            LinuxSeccompAction::ScmpActErrno => Action::Errno(1),
+            LinuxSeccompAction::ScmpActKill => Action::KillThread,
+            LinuxSeccompAction::ScmpActKillProcess => Action::KillProcess,
+            LinuxSeccompAction::ScmpActLog => Action::Allow,
+            LinuxSeccompAction::ScmpActTrap => Action::Trap,
+            _ => {
+                return Err(KuroError::Seccomp(format!(
+                    "Unsupported seccomp action: {:?}",
+                    action
+                )));
+            }
+        };
+
+        Ok(res)
+    }
+}
+</file>
+
+<file path="src/sync/mod.rs">
+pub mod fifo;
+pub mod pipe;
+</file>
+
+<file path=".gitignore">
+/target
+/alpinefs
+</file>
+
+<file path="Cargo.toml">
+[package]
+name = "kuro"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+caps = { version = "0.5.6", features = ["serde", "serde_support"] }
+clap = { version = "4.6.6", features = ["derive"] }
+libc = "0.2.189"
+nix = { version = "0.31.3", features = [
+  "process",
+  "mount",
+  "sched",
+  "signal",
+  "user",
+  "fs",
+  "hostname",
+  "resource",
+  "term",
+] }
+oci-spec = "0.10.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+syscallz = "0.17.0"
+thiserror = "2.0.20"
+</file>
+
+<file path="src/main.rs">
+use clap::Parser;
+
+use crate::{
+    cli::{commands::CliArgs, handle::handle_commands},
+    error::Result,
+};
+
+mod cgroups;
+mod cli;
+mod config;
+mod container;
+mod devices;
+mod error;
+mod namespaces;
+mod sync;
+
+fn main() -> Result<()> {
+    let args = CliArgs::try_parse().unwrap_or_else(|e| e.exit());
+    if let Err(e) = handle_commands(&args) {
+        return Err(e);
+    }
+
+    Ok(())
+}
+</file>
+
+<file path="src/namespaces/mod.rs">
+pub mod mount;
+pub mod netns;
+pub mod security;
+pub mod userns;
+</file>
+
+<file path="src/cli/handle.rs">
+use std::{collections::HashMap, path::PathBuf, str::FromStr};
+
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
+
+use crate::{
+    cli::commands::{CliArgs, Commands},
+    config::spec::load_spec,
+    container::{
+        builder::CBuilder,
+        cleanup::ContainerCleanup,
+        state::{ContainerState, ContainerStatus},
+    },
+    error::{KuroError, Result, validate_id},
+    sync::{fifo::ExecFifo, pipe::SyncPipe},
+};
+
+pub fn handle_commands(args: &CliArgs) -> Result<()> {
+    match &args.command {
+        // --- OCI-Compliant Mandatory Commands ---
+        // // Create
+        Commands::Create {
+            container_id,
+            bundle_path,
+        } => {
+            validate_id(&container_id)?;
+
+            // Validate bundle path
+            let bundle_path = PathBuf::from(bundle_path);
+            if !bundle_path.exists() || !bundle_path.is_dir() {
+                return Err(KuroError::InvalidArgs(format!(
+                    "bundle_path '{}' does not exist or is not a directory",
+                    bundle_path.display()
+                )));
+            }
+
+            // Convert bundle path to absolute path
+            let bundle = bundle_path.canonicalize().map_err(|e| {
+                KuroError::InvalidArgs(format!(
+                    "Failed to resolve absolute path for bundle '{}': {}",
+                    bundle_path.display(),
+                    e
+                ))
+            })?;
+
+            // Load spec config.json
+            let spec = load_spec(&bundle)?;
+
+            // Check existence of rootfs directory
+            let root = spec
+                .root()
+                .as_ref()
+                .ok_or_else(|| KuroError::InvalidBundle {
+                    path: bundle.clone(),
+                    reason: "config.json is missing the 'root' section".to_string(),
+                })?;
+            let rootfs_rel_path = root.path();
+            let rootfs_full_path = bundle.join(rootfs_rel_path);
+            if !rootfs_full_path.exists() {
+                return Err(KuroError::InvalidArgs(format!(
+                    "bundle_path does not contain rootfs directory at '{}'",
+                    rootfs_rel_path.display()
+                )));
+            }
+
+            // Get annotations
+            let annotations = spec.annotations().as_ref().cloned().unwrap_or_default();
+
+            // Create initial state
+            let state = ContainerState {
+                oci_version: spec.version().to_owned(),
+                id: container_id.to_owned(),
+                status: ContainerStatus::Creating,
+                pid: -1,
+                bundle: bundle.to_string_lossy().into_owned(),
+                annotations,
+            };
+
+            // Save initial state to disk
+            state.save()?;
+
+            // Run container builder
+            let mut builder = CBuilder::new(container_id.to_owned(), bundle_path, &spec);
+            match builder.create() {
+                Ok(pid) => println!(
+                    "[kuro] Container {} created successfully with PID {}",
+                    container_id,
+                    pid.to_string()
+                ),
+                Err(e) => {
+                    eprintln!("[kuro] {}", e);
+                    ContainerCleanup::new(container_id.as_str(), builder.pid).cleanup()?;
+
+                    return Err(e);
+                }
+            }
+        }
+
+        // // Start
+        Commands::Start { container_id } => {
+            validate_id(&container_id)?;
+
+            let mut state = ContainerState::load(&container_id)?;
+            if state.status != ContainerStatus::Created {
+                return Err(KuroError::Start(format!(
+                    "Container '{}' is in {:?} state, expected Created",
+                    &container_id, state.status
+                )));
+            }
+
+            let spec = load_spec(&PathBuf::from(&state.bundle))?;
+
+            // Signal PID 1 to start container
+            let state_dir = ContainerState::get_state_dir(&container_id);
+            ExecFifo::signal_start(&state_dir)?;
+
+            // Update status -> Running
+            state.status = ContainerStatus::Running;
+            state.save()?;
+
+            // [x]   Execute poststart hooks (runtime)
+            CBuilder::run_hook(&spec, &container_id, "poststart")?;
+
+            println!("Started container {}...", container_id);
+        }
+
+        // // State
+        Commands::State { container_id } => {
+            validate_id(&container_id)?;
+
+            let state = ContainerState::load(container_id)?;
+            println!("{}", serde_json::to_string_pretty(&state).unwrap());
+        }
+
+        // // Kill
+        Commands::Kill {
+            container_id,
+            signal,
+        } => {
+            validate_id(&container_id)?;
+
+            let sig_str = if signal.trim().is_empty() {
+                "SIGTERM"
+            } else {
+                signal.as_str()
+            };
+            let sig = parse_signal(sig_str)?;
+            let state = ContainerState::load(&container_id)?;
+
+            if state.status == ContainerStatus::Stopped {
+                return Err(KuroError::InvalidArgs(format!(
+                    "Container '{}' is already stopped",
+                    &container_id
+                )));
+            }
+
+            let pid = Pid::from_raw(state.pid);
+
+            kill(pid, sig).map_err(|e| {
+                KuroError::ExecFailed(format!(
+                    "Failed to send signal {:?} to PID {}: {}",
+                    sig, pid, e
+                ))
+            })?;
+
+            println!("[kuro] Signal {:?} sent to container {}", sig, container_id);
+        }
+
+        // // Delete
+        Commands::Delete { container_id } => {
+            validate_id(&container_id)?;
+
+            println!("[kuro] Deleting container {}...", container_id);
+
+            let state = ContainerState::load(&container_id).ok();
+            let pid = state.as_ref().map(|s| s.pid);
+
+            ContainerCleanup::new(container_id, pid).cleanup()?;
+
+            // Poststop hooks
+            if let Some(s) = &state {
+                let bundle_path = PathBuf::from(&s.bundle);
+                if let Ok(spec) = load_spec(&bundle_path) {
+                    // let builder = CBuilder::new(container_id.to_owned(), bundle_path, &spec);
+                    // builder.run_hook("poststop")?;
+                    CBuilder::run_hook(&spec, &container_id, "poststop")?;
+                }
+            }
+
+            return Ok(());
+        }
+    }
+
+    Ok(())
+}
+
+// Parse signal string to Signal variant
+fn parse_signal(sig: &str) -> Result<Signal> {
+    let sig_upper = sig.trim().to_uppercase();
+
+    let normalized = if sig_upper.parse::<i32>().is_ok() {
+        let num: i32 = sig_upper.parse().unwrap();
+        Signal::try_from(num)
+            .map_err(|_| KuroError::InvalidArgs(format!("Invalid signal number: {}", num)))?
+    } else if sig_upper.starts_with("SIG") {
+        Signal::from_str(&sig_upper)
+            .map_err(|_| KuroError::InvalidArgs(format!("Invalid signal name: {}", sig)))?
+    } else {
+        Signal::from_str(&format!("SIG{}", sig_upper))
+            .map_err(|_| KuroError::InvalidArgs(format!("Invalid signal name: {}", sig)))?
+    };
+
+    Ok(normalized)
+}
+</file>
+
+<file path="src/error.rs">
+use oci_spec::OciSpecError;
+use std::path::PathBuf;
+use thiserror::Error;
+
+pub type Result<T> = std::result::Result<T, KuroError>;
+
+#[derive(Debug, Error)]
+pub enum KuroError {
+    // --- Systems/IO Errors ---
+    #[error("IO error occurred: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("System call failed: {0}")]
+    Nix(#[from] nix::Error),
+
+    #[error("JSON serialization/deserialization failed: {0}")]
+    Json(#[from] serde_json::Error),
+
+    // --- CLI & Configuration Errors ---
+    #[error("Hook error: {0}")]
+    Hook(String),
+
+    #[error("Invalid arguments: {0}")]
+    InvalidArgs(String),
+
+    #[error("Invalid bundle path at {path}: {reason}")]
+    InvalidBundle { path: PathBuf, reason: String },
+
+    #[error("Config error: {0}")]
+    InvalidSpec(String),
+
+    #[error("State file not found for container {id}")]
+    ContainerStateNotFound { id: String },
+
+    #[error("Container '{id}' not found")]
+    ContainerNotFound { id: String },
+
+    #[error("Container '{id}' is already running")]
+    ContainerAlreadyExists { id: String },
+
+    #[error("Container cleanup error: {0}")]
+    ContainerCleanup(String),
+
+    #[error("Error with config specification: {0}")]
+    OciSpecError(#[from] OciSpecError),
+
+    // --- Subsystem Specific Errors ---
+    #[error("Namespace error: {0}")]
+    Namespace(String),
+
+    #[error("User namespace error: {0}")]
+    Userns(String),
+
+    #[error("Network namespace error: {0}")]
+    Netns(String),
+
+    #[error("Cgroup error: {0}")]
+    Cgroup(String),
+
+    #[error("Mount error: {0}")]
+    Mount(String),
+
+    #[error("Mount failed for target '{target}': {source}")]
+    MountFailed {
+        target: String,
+        #[source]
+        source: nix::Error,
+    },
+
+    #[error("Capability error: {0}")]
+    Capability(String),
+
+    #[error("Rlimits error: {0}")]
+    Rlimits(String),
+
+    #[error("No new privileges error: {0}")]
+    NoNewPrivs(String),
+
+    #[error("Seccomp error: {0}")]
+    Seccomp(String),
+
+    // --- Executation & Process Sync Errors ---
+    #[error("Synchronization pipe error: {0}")]
+    SyncPipe(String),
+
+    #[error("Command execution failed: {0}")]
+    ExecFailed(String),
+
+    // --- Command Errors ---
+    #[error("Start error: {0}")]
+    Start(String),
+
+    // --- Catch-all Dynamic Error Wrapper ---
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+}
+
+// --- Validation Utils ---
+pub fn validate_id(container_id: &str) -> Result<()> {
+    if container_id.trim().is_empty() {
+        return Err(KuroError::InvalidArgs(
+            "container_id cannot be empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+</file>
+
+<file path="src/container/builder.rs">
+use std::{
+    ffi::CString,
+    fs::File,
+    io::Write,
+    os::fd::AsFd,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::Duration,
+};
+
+use crate::{
+    cgroups::v2::CgroupMgr,
+    container::state::{ContainerState, ContainerStatus},
+    devices::{devices::DevMgr, terminal::TermMgr},
+    error::{KuroError, Result},
+    namespaces::{mount::MountMgr, netns::NetMgr, security::SecMgr, userns::UserMgr},
+    sync::{fifo::ExecFifo, pipe::SyncPipe},
+};
+use nix::{
+    sched::{CloneFlags, clone, setns},
+    sys::signal::Signal,
+    unistd::{Pid, execve, sethostname},
+};
+use oci_spec::runtime::{Hook, LinuxNamespaceType, Spec};
+
+// 1MB stack size for container child process
+const STACK_SIZE: usize = 1024 * 1024;
+
+pub struct CBuilder<'a> {
+    pub container_id: String,
+    pub bundle_path: PathBuf,
+    pub spec: &'a Spec,
+    pub pid: Option<i32>,
+}
+
+impl<'a> CBuilder<'a> {
+    /// Setup new container builder
+    pub fn new(container_id: String, bundle_path: PathBuf, spec: &'a Spec) -> Self {
+        Self {
+            container_id,
+            bundle_path,
+            spec,
+            pid: None,
+        }
+    }
+
+    /// Run lifecycle hooks
+    pub fn run_hook(spec: &'a Spec, container_id: &str, hook: &str) -> Result<()> {
+        if let Some(hooks) = spec.hooks() {
+            let hook_list = match hook {
+                "prestart" => hooks.prestart().as_deref(),
+                "createRuntime" => hooks.create_runtime().as_deref(),
+                "createContainer" => hooks.create_container().as_deref(),
+                "startContainer" => hooks.start_container().as_deref(),
+                "poststart" => hooks.poststart().as_deref(),
+                "poststop" => hooks.poststop().as_deref(),
+                _ => return Err(KuroError::Hook(format!("Unknown hook type: {}", hook))),
+            };
+
+            if let Some(list) = hook_list {
+                let state = ContainerState::load(&container_id)?;
+                let state_json = serde_json::to_string(&state).map_err(|e| {
+                    KuroError::Hook(format!("Failed to serialize container state: {}", e))
+                })?;
+
+                for hfn in list {
+                    Self::execute_hook(hfn, &state_json)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Create container
+    pub fn create(&mut self) -> Result<Pid> {
+        // Create sync pipes
+        let parent_to_child = SyncPipe::new()?;
+        let child_to_parent = SyncPipe::new()?;
+
+        // Get clone flags
+        let clone_flags = self.get_clone_flags()?;
+
+        // Prepare child stack
+        let mut stk = vec![0u8; STACK_SIZE];
+
+        // Closure executed in child process
+        let child_fn = Box::new(|| -> isize {
+            match self.run_child_init(&child_to_parent, &parent_to_child) {
+                Ok(_) => 0,
+                Err(e) => {
+                    eprintln!("[kuro-child] Error during initialization: {}", e);
+                    1
+                }
+            }
+        });
+
+        // Clone the process into new namespaces
+        let child_pid = unsafe {
+            clone(
+                child_fn,
+                &mut stk,
+                clone_flags,
+                Some(Signal::SIGCHLD as i32),
+            )
+            .map_err(|e| KuroError::ExecFailed(format!("Failed to clone child process: {}", e)))?
+        };
+
+        println!(
+            "[kuro-host] Spawned container init process with PID: {}",
+            child_pid
+        );
+        self.pid = Some(child_pid.as_raw());
+
+        // Setup user namespace mappings
+        if let Some(linux) = self.spec.linux() {
+            UserMgr::set_mappings(
+                child_pid,
+                linux.uid_mappings().as_deref(),
+                linux.gid_mappings().as_deref(),
+            )?;
+        }
+
+        // Setup cgroups
+        let cmgr = CgroupMgr::new(&self.container_id)?;
+        if let Some(linux) = self.spec.linux() {
+            if let Some(rsrcs) = linux.resources() {
+                cmgr.apply_limits(rsrcs)?;
+            }
+        }
+        cmgr.add_proc(child_pid)?;
+
+        // Update and save state (status = Created)
+        // let mut state = ContainerState::load(&self.container_id)?;
+        // state.status = ContainerStatus::Created;
+        // state.save()?;
+
+        // [x]   Write UID/GID mappings
+        // [x]   Create and add child_pid to cgroups-v2
+        // [x]   Apply resource limits
+        // [x]   Setup network interfaces in netns
+        // [x]   Save container state (status = Created)
+        // [x]   Network Manager implemented, but move calling from host to child process
+        // [x]   createRuntime hooks
+
+        // Signal child that host setup is done
+        parent_to_child.send_signal()?;
+
+        // Wait for child to ack rootfs + security setup
+        child_to_parent.wait_for_signal()?;
+
+        // Update and save state (status = Created)
+        let mut state = ContainerState::load(&self.container_id)?;
+        state.status = ContainerStatus::Created;
+        state.save()?;
+
+        // Child setup completed; can run hooks now
+        Self::run_hook(&self.spec, &self.container_id, "prestart")?;
+        Self::run_hook(&self.spec, &self.container_id, "createRuntime")?;
+
+        // Signal child that parent has run hooks
+        parent_to_child.send_signal()?;
+
+        // Wait for child to run their hooks
+        child_to_parent.wait_for_signal()?;
+
+        Ok(child_pid)
+    }
+
+    /// Start container
+    pub fn start(spec: &'a Spec) -> Result<()> {
+        let proc = spec
+            .process()
+            .as_ref()
+            .ok_or_else(|| KuroError::InvalidSpec("Missing 'process' field in spec".to_string()))?;
+        let args = proc.args().as_ref().ok_or_else(|| {
+            KuroError::InvalidSpec("Missing 'process.args' field in spec".to_string())
+        })?;
+        if args.is_empty() {
+            return Err(KuroError::InvalidSpec(
+                "process.args cannot be empty".to_string(),
+            ));
+        }
+
+        // Convert process.args into executable path CString
+        let path = CString::new(args[0].as_str())
+            .map_err(|e| KuroError::ExecFailed(format!("Failed to create CString: {}", e)))?;
+
+        // Convert full process.args to CString array
+        let argv: Vec<CString> = args
+            .iter()
+            .map(|arg| {
+                CString::new(arg.as_str())
+                    .map_err(|e| KuroError::ExecFailed(format!("Failed to create CString: {}", e)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Convert process.env to CString vector
+        let env_spec = proc.env().as_deref().unwrap_or(&[]);
+        let envp: Vec<CString> = env_spec
+            .iter()
+            .map(|env| {
+                CString::new(env.as_str())
+                    .map_err(|e| KuroError::ExecFailed(format!("Failed to create CString: {}", e)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Drop privileges finally
+        SecMgr::setup_security(&spec)?;
+        if let Some(linux) = spec.linux() {
+            if let Some(seccomp) = linux.seccomp() {
+                SecMgr::apply_seccomp(&seccomp)?;
+            }
+        }
+
+        // Call execve
+        execve(&path, &argv, &envp)
+            .map_err(|e| KuroError::ExecFailed(format!("execve failed for {}: {}", args[0], e)))?;
+
+        Ok(())
+    }
+
+    /// Child container execution (Level 2)
+    fn run_child_init(&self, child_to_parent: &SyncPipe, parent_to_child: &SyncPipe) -> Result<()> {
+        // Wait for host to complete setup
+        parent_to_child.wait_for_signal()?;
+
+        // Open FIFO pipe file and acquire file descriptor
+        let state_dir = ContainerState::get_state_dir(&self.container_id);
+        let fifo_path = ExecFifo::init(&state_dir)?;
+        let fifo = ExecFifo::open_for_read(&fifo_path)?;
+
+        // Handle all namespaces
+        if let Some(linux) = self.spec.linux() {
+            if let Some(namespaces) = linux.namespaces() {
+                for ns in namespaces {
+                    Self::setup_ns(ns.typ(), ns.path().as_ref())?;
+                }
+            }
+        }
+
+        // Set hostname
+        if let Some(hostname) = self.spec.hostname() {
+            sethostname(hostname).map_err(|e| {
+                KuroError::Namespace(format!("Failed to set hostname '{}': {}", hostname, e))
+            })?;
+        }
+
+        // Setup mounts, pivot_root, and masked/readonly paths
+        MountMgr::setup_mount(self.spec, &self.container_id, &self.bundle_path)?;
+
+        // Create device nodes and symlinks
+        let dev_spec = self
+            .spec
+            .linux()
+            .as_ref()
+            .and_then(|l| l.devices().as_deref());
+        DevMgr::create_devices(dev_spec)?;
+
+        // Apply device cgroup rules
+        if let Some(linux) = self.spec.linux() {
+            if let Some(rsrcs) = linux.resources() {
+                if let Some(dev_rules) = rsrcs.devices() {
+                    let cgroup_path = PathBuf::from("/sys/fs/cgroup/kuro").join(&self.container_id);
+                    CgroupMgr::apply_device_rules(&cgroup_path, dev_rules)?;
+                }
+            }
+        }
+
+        // Handle interactive terminal (PTY)
+        let interactive = self
+            .spec
+            .process()
+            .as_ref()
+            .and_then(|p| p.terminal())
+            .unwrap_or(false);
+        let _master_fd = TermMgr::setup_terminal(interactive)?;
+
+        // [x]   Setup hostname
+        // [x]   Mount filesystems and pivot_root
+        // [x]   Masked and readonly paths
+        // [x]   Apply capabilities, rlimits, env vars, no_new_privs
+        // [x]   createContainer hooks
+
+        // Signal parent that container setup is ready
+        child_to_parent.send_signal()?;
+
+        // Wait for parent to run hooks
+        parent_to_child.wait_for_signal()?;
+
+        // Parent has run hooks, now child will run hook
+        Self::run_hook(&self.spec, &self.container_id, "createContainer")?;
+
+        // Signal parent that child is ready and paused
+        child_to_parent.send_signal()?;
+
+        // [x]   Pause for 'kuro start' signal
+        println!("[kuro] Container initialized and paused, ready to start");
+        ExecFifo::wait_for_start(fifo)?;
+
+        // Unblocked -> Call start method
+        Self::run_hook(&self.spec, &self.container_id, "startContainer")?;
+        Self::start(&self.spec)?;
+
+        Ok(())
+    }
+
+    /// Detect and attach different namespaces dynamically
+    fn setup_ns(typ: LinuxNamespaceType, path: Option<&PathBuf>) -> Result<()> {
+        // EXCLUDE UserNS: Mapping already compelete in host
+        if typ == LinuxNamespaceType::User {
+            return Ok(());
+        }
+
+        if let Some(path) = path {
+            // Path provided; attach existing namespace
+            let fd = File::open(&path).map_err(|e| {
+                KuroError::Namespace(format!("Failed to open namespace path: {}", e))
+            })?;
+            if let Some(flag) = Self::get_clone_flag(typ) {
+                setns(fd.as_fd(), flag).map_err(|e| {
+                    KuroError::Namespace(format!(
+                        "Failed to set namespace '{}' to path '{:?}': {}",
+                        typ.to_string(),
+                        path,
+                        e
+                    ))
+                })?;
+            } else {
+                // Unsupported flags / namespace types (time)
+                return Err(KuroError::Namespace(format!(
+                    "Unsupported namespace type: {}",
+                    typ.to_string()
+                )));
+            }
+        } else {
+            // Path not provided; create and setup new namespace
+            Self::call_setup_fns(typ)?;
+        }
+
+        Ok(())
+    }
+
+    /// Get clone flag from namespace type
+    fn get_clone_flag(typ: LinuxNamespaceType) -> Option<CloneFlags> {
+        match typ {
+            LinuxNamespaceType::Pid => Some(CloneFlags::CLONE_NEWPID),
+            LinuxNamespaceType::Network => Some(CloneFlags::CLONE_NEWNET),
+            LinuxNamespaceType::Ipc => Some(CloneFlags::CLONE_NEWIPC),
+            LinuxNamespaceType::Uts => Some(CloneFlags::CLONE_NEWUTS),
+            LinuxNamespaceType::Mount => Some(CloneFlags::CLONE_NEWNS),
+            LinuxNamespaceType::Cgroup => Some(CloneFlags::CLONE_NEWCGROUP),
+            LinuxNamespaceType::User => Some(CloneFlags::CLONE_NEWUSER),
+            // LinuxNamespaceType::Time => libc::CLONE_NEWTIME as CloneFlags,
+            _ => None,
+        }
+    }
+
+    /// Call namespace setup methods dynamically
+    fn call_setup_fns(typ: LinuxNamespaceType) -> Result<()> {
+        match typ {
+            LinuxNamespaceType::Network => NetMgr::setup_network(),
+            LinuxNamespaceType::Mount
+            | LinuxNamespaceType::Pid
+            | LinuxNamespaceType::Uts
+            | LinuxNamespaceType::Ipc
+            | LinuxNamespaceType::Cgroup => return Ok(()),
+            _ => Err(KuroError::Namespace(
+                "Unsupported namespace type".to_string(),
+            )),
+        }
+    }
+
+    /// Get clone flags from spec
+    fn get_clone_flags(&self) -> Result<CloneFlags> {
+        let mut flags = CloneFlags::empty();
+
+        if let Some(linux) = self.spec.linux() {
+            if let Some(namespaces) = linux.namespaces() {
+                for ns in namespaces {
+                    // Only add clone flags for namespaces having no external path
+                    if ns.path().is_none() {
+                        if let Some(flag) = Self::get_clone_flag(ns.typ()) {
+                            flags.insert(flag);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(flags)
+    }
+
+    /// Execute hook function
+    fn execute_hook(hook: &Hook, state: &str) -> Result<()> {
+        let path = hook.path();
+        let mut cmd = Command::new(path);
+
+        if let Some(args) = hook.args() {
+            if args.len() > 1 {
+                cmd.args(&args[1..]);
+            }
+        }
+
+        if let Some(vars) = hook.env() {
+            for env in vars {
+                if let Some((key, val)) = env.split_once('=') {
+                    cmd.env(key, val);
+                }
+            }
+        }
+
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
+
+        let mut child = cmd.spawn().map_err(|e| {
+            KuroError::Hook(format!("Failed to spawn hook binary: {:?}: {}", path, e))
+        })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(state.as_bytes()).map_err(|e| {
+                KuroError::Hook(format!("Failed to write state JSON to hook stdin: {}", e))
+            })?;
+        }
+
+        let status = child
+            .wait()
+            .map_err(|e| KuroError::Hook(format!("Error waiting for hook process: {}", e)))?;
+        if !status.success() {
+            return Err(KuroError::Hook(format!(
+                "Hook '{:?}' failed with exit code: {:?}",
+                path,
+                status.code()
+            )));
+        }
+
+        Ok(())
+    }
+}
+</file>
+
+</files>

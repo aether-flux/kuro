@@ -14,7 +14,10 @@ use crate::{
     devices::{devices::DevMgr, terminal::TermMgr},
     error::{KuroError, Result},
     namespaces::{mount::MountMgr, netns::NetMgr, security::SecMgr, userns::UserMgr},
-    sync::{fifo::ExecFifo, pipe::SyncPipe},
+    sync::{
+        fifo::ExecFifo,
+        pipe::{SyncPipe, SyncResult},
+    },
 };
 use nix::{
     sched::{CloneFlags, clone, setns},
@@ -89,7 +92,7 @@ impl<'a> CBuilder<'a> {
             match self.run_child_init(&child_to_parent, &parent_to_child) {
                 Ok(_) => 0,
                 Err(e) => {
-                    eprintln!("[kuro-child] Error during initialization: {}", e);
+                    eprintln!("[kuro] Error during initialization: {}", e);
                     1
                 }
             }
@@ -131,9 +134,9 @@ impl<'a> CBuilder<'a> {
         cmgr.add_proc(child_pid)?;
 
         // Update and save state (status = Created)
-        let mut state = ContainerState::load(&self.container_id)?;
-        state.status = ContainerStatus::Created;
-        state.save()?;
+        // let mut state = ContainerState::load(&self.container_id)?;
+        // state.status = ContainerStatus::Created;
+        // state.save()?;
 
         // [x]   Write UID/GID mappings
         // [x]   Create and add child_pid to cgroups-v2
@@ -144,20 +147,51 @@ impl<'a> CBuilder<'a> {
         // [x]   createRuntime hooks
 
         // Signal child that host setup is done
-        parent_to_child.send_signal()?;
+        parent_to_child.send_ready()?;
 
         // Wait for child to ack rootfs + security setup
-        child_to_parent.wait_for_signal()?;
+        match child_to_parent.wait_for_signal()? {
+            SyncResult::Ready => {}
+            SyncResult::Error(msg) => {
+                return Err(KuroError::ExecFailed(format!(
+                    "Child initialization failed: {}",
+                    msg
+                )));
+            }
+            SyncResult::Eof => {
+                return Err(KuroError::ExecFailed(
+                    "Child died unexpectedly before setup completion".to_string(),
+                ));
+            }
+        }
+
+        // Update and save state (status = Created)
+        let mut state = ContainerState::load(&self.container_id)?;
+        state.status = ContainerStatus::Created;
+        state.save()?;
 
         // Child setup completed; can run hooks now
         Self::run_hook(&self.spec, &self.container_id, "prestart")?;
         Self::run_hook(&self.spec, &self.container_id, "createRuntime")?;
 
         // Signal child that parent has run hooks
-        parent_to_child.send_signal()?;
+        parent_to_child.send_ready()?;
 
         // Wait for child to run their hooks
-        child_to_parent.wait_for_signal()?;
+        match child_to_parent.wait_for_signal()? {
+            SyncResult::Ready => {}
+            SyncResult::Error(msg) => {
+                return Err(KuroError::ExecFailed(format!(
+                    "Child failed while running hooks: {}",
+                    msg
+                )));
+            }
+            SyncResult::Eof => {
+                return Err(KuroError::ExecFailed(
+                    "Child died unexpectedly while running hooks".to_string(),
+                ));
+            }
+        }
 
         Ok(child_pid)
     }
@@ -218,58 +252,73 @@ impl<'a> CBuilder<'a> {
     /// Child container execution (Level 2)
     fn run_child_init(&self, child_to_parent: &SyncPipe, parent_to_child: &SyncPipe) -> Result<()> {
         // Wait for host to complete setup
-        parent_to_child.wait_for_signal()?;
+        match parent_to_child.wait_for_signal()? {
+            SyncResult::Ready => {}
+            SyncResult::Error(msg) => {
+                return Err(KuroError::ExecFailed(format!("Host setup failed: {}", msg)));
+            }
+            SyncResult::Eof => {
+                return Err(KuroError::ExecFailed(
+                    "Host exited unexpectedly before signalling child".to_string(),
+                ));
+            }
+        }
 
         // Open FIFO pipe file and acquire file descriptor
         let state_dir = ContainerState::get_state_dir(&self.container_id);
         let fifo_path = ExecFifo::init(&state_dir)?;
         let fifo = ExecFifo::open_for_read(&fifo_path)?;
 
-        // Handle all namespaces
-        if let Some(linux) = self.spec.linux() {
-            if let Some(namespaces) = linux.namespaces() {
-                for ns in namespaces {
-                    Self::setup_ns(ns.typ(), ns.path().as_ref())?;
+        let setup_child = (|| -> Result<()> {
+            // Handle all namespaces
+            if let Some(linux) = self.spec.linux() {
+                if let Some(namespaces) = linux.namespaces() {
+                    for ns in namespaces {
+                        Self::setup_ns(ns.typ(), ns.path().as_ref())?;
+                    }
                 }
             }
-        }
 
-        // Set hostname
-        if let Some(hostname) = self.spec.hostname() {
-            sethostname(hostname).map_err(|e| {
-                KuroError::Namespace(format!("Failed to set hostname '{}': {}", hostname, e))
-            })?;
-        }
+            // Set hostname
+            if let Some(hostname) = self.spec.hostname() {
+                sethostname(hostname).map_err(|e| {
+                    KuroError::Namespace(format!("Failed to set hostname '{}': {}", hostname, e))
+                })?;
+            }
 
-        // Setup mounts, pivot_root, and masked/readonly paths
-        MountMgr::setup_mount(self.spec, &self.container_id, &self.bundle_path)?;
+            // Setup mounts, pivot_root, and masked/readonly paths
+            MountMgr::setup_mount(self.spec, &self.container_id, &self.bundle_path)?;
 
-        // Create device nodes and symlinks
-        let dev_spec = self
-            .spec
-            .linux()
-            .as_ref()
-            .and_then(|l| l.devices().as_deref());
-        DevMgr::create_devices(dev_spec)?;
+            // Create device nodes and symlinks
+            let dev_spec = self
+                .spec
+                .linux()
+                .as_ref()
+                .and_then(|l| l.devices().as_deref());
+            DevMgr::create_devices(dev_spec)?;
 
-        // Apply device cgroup rules
-        if let Some(linux) = self.spec.linux() {
-            if let Some(rsrcs) = linux.resources() {
-                if let Some(dev_rules) = rsrcs.devices() {
-                    let cgroup_path = PathBuf::from("/sys/fs/cgroup/kuro").join(&self.container_id);
-                    CgroupMgr::apply_device_rules(&cgroup_path, dev_rules)?;
+            // Apply device cgroup rules
+            if let Some(linux) = self.spec.linux() {
+                if let Some(rsrcs) = linux.resources() {
+                    if let Some(dev_rules) = rsrcs.devices() {
+                        let cgroup_path =
+                            PathBuf::from("/sys/fs/cgroup/kuro").join(&self.container_id);
+                        CgroupMgr::apply_device_rules(&cgroup_path, dev_rules)?;
+                    }
                 }
             }
-        }
 
-        // Handle interactive terminal (PTY)
-        let interactive = self
-            .spec
-            .process()
-            .as_ref()
-            .and_then(|p| p.terminal())
-            .unwrap_or(false);
-        let _master_fd = TermMgr::setup_terminal(interactive)?;
+            // Handle interactive terminal (PTY)
+            let interactive = self
+                .spec
+                .process()
+                .as_ref()
+                .and_then(|p| p.terminal())
+                .unwrap_or(false);
+            let _master_fd = TermMgr::setup_terminal(interactive)?;
+
+            Ok(())
+        })();
 
         // [x]   Setup hostname
         // [x]   Mount filesystems and pivot_root
@@ -277,17 +326,38 @@ impl<'a> CBuilder<'a> {
         // [x]   Apply capabilities, rlimits, env vars, no_new_privs
         // [x]   createContainer hooks
 
+        if let Err(e) = setup_child {
+            let _ = child_to_parent.send_err(&e.to_string());
+            return Err(e);
+        }
+
         // Signal parent that container setup is ready
-        child_to_parent.send_signal()?;
+        child_to_parent.send_ready()?;
 
         // Wait for parent to run hooks
-        parent_to_child.wait_for_signal()?;
+        match parent_to_child.wait_for_signal()? {
+            SyncResult::Ready => {}
+            SyncResult::Error(msg) => {
+                return Err(KuroError::ExecFailed(format!(
+                    "Host failed hook execution: {}",
+                    msg
+                )));
+            }
+            SyncResult::Eof => {
+                return Err(KuroError::ExecFailed(
+                    "Host process exited before completing hooks".to_string(),
+                ));
+            }
+        }
 
         // Parent has run hooks, now child will run hook
-        Self::run_hook(&self.spec, &self.container_id, "createContainer")?;
+        if let Err(e) = Self::run_hook(&self.spec, &self.container_id, "createContainer") {
+            let _ = child_to_parent.send_err(&e.to_string());
+            return Err(e);
+        }
 
         // Signal parent that child is ready and paused
-        child_to_parent.send_signal()?;
+        child_to_parent.send_ready()?;
 
         // [x]   Pause for 'kuro start' signal
         println!("[kuro] Container initialized and paused, ready to start");
