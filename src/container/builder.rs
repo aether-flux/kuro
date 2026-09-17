@@ -85,7 +85,8 @@ impl<'a> CBuilder<'a> {
         let clone_flags = self.get_clone_flags()?;
 
         // Prepare child stack
-        let mut stk = vec![0u8; STACK_SIZE];
+        let mut stk = vec![0u8; STACK_SIZE].into_boxed_slice();
+        // let stk_ptr = Box::into_raw(stk);
 
         // Closure executed in child process
         let child_fn = Box::new(|| -> isize {
@@ -93,13 +94,17 @@ impl<'a> CBuilder<'a> {
                 Ok(_) => 0,
                 Err(e) => {
                     eprintln!("[kuro] Error during initialization: {}", e);
-                    1
+                    std::process::exit(1);
                 }
             }
         });
 
         // Clone the process into new namespaces
         let child_pid = unsafe {
+            // let stk_top = (*stk_ptr).as_mut_ptr().add(STACK_SIZE);
+            // let stk_slice: &mut [u8] =
+            //     std::slice::from_raw_parts_mut(stk_ptr as *mut u8, STACK_SIZE);
+
             clone(
                 child_fn,
                 &mut stk,
@@ -164,11 +169,14 @@ impl<'a> CBuilder<'a> {
                 ));
             }
         }
+        println!("child returned signal");
 
         // Update and save state (status = Created)
         let mut state = ContainerState::load(&self.container_id)?;
         state.status = ContainerStatus::Created;
+        state.pid = i32::from(child_pid);
         state.save()?;
+        println!("state updated from host");
 
         // Child setup completed; can run hooks now
         Self::run_hook(&self.spec, &self.container_id, "prestart")?;
@@ -268,6 +276,7 @@ impl<'a> CBuilder<'a> {
         let state_dir = ContainerState::get_state_dir(&self.container_id);
         let fifo_path = ExecFifo::init(&state_dir)?;
         let fifo = ExecFifo::open_for_read(&fifo_path)?;
+        println!("opened fifo pipe");
 
         let setup_child = (|| -> Result<()> {
             // Handle all namespaces
@@ -325,6 +334,7 @@ impl<'a> CBuilder<'a> {
 
             Ok(())
         })();
+        println!("setup fn called");
 
         // [x]   Setup hostname
         // [x]   Mount filesystems and pivot_root
@@ -336,9 +346,11 @@ impl<'a> CBuilder<'a> {
             let _ = child_to_parent.send_err(&e.to_string());
             return Err(e);
         }
+        println!("setup fn wasnt error");
 
         // Signal parent that container setup is ready
         child_to_parent.send_ready()?;
+        println!("sent signal to host that child setup done");
 
         // Wait for parent to run hooks
         match parent_to_child.wait_for_signal()? {
@@ -370,6 +382,7 @@ impl<'a> CBuilder<'a> {
         ExecFifo::wait_for_start(fifo)?;
 
         // Unblocked -> Call start method
+        println!("unblocked child");
         Self::run_hook(&self.spec, &self.container_id, "startContainer")?;
         Self::start(&self.spec)?;
 

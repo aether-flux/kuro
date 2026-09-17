@@ -81,21 +81,6 @@ DOC.md
 <files>
 This section contains the contents of the repository's files.
 
-<file path="DOC.md">
-### &Option<_>
-- &Option<> is bad. Its lifetime gets over when the line getting that value is done executing.
-- Fix: Use .as_ref() to convert &Option<_> into Option<&_>.
-
-### uid/gid helpers
-- setuidmap/setgidmap: Helper binaries with necessary capabilities enabled (SETUID/SETGID)
-- setuid/setgid: When ran on unprivileged process, or going from root to dropping root privileges, sets all three (real, effective, saved set) uid/gid
-- setresuid/setresgid: Explicitly sets real, effective, saved set uid/gid
-
-### kill()
-- Sending kill signal to pid=0 sends signal to every process in the caller's process group
-- Sending kill signal to pid=-1 sends signal to every single process on the system that the user has permission to kill (so as sudo, every process ever)
-</file>
-
 <file path="src/cli/commands.rs">
 use clap::{Parser, Subcommand};
 
@@ -163,76 +148,6 @@ pub fn load_spec(bundle: &Path) -> Result<Spec> {
     let spec = Spec::load(spec_path)?;
 
     Ok(spec)
-}
-</file>
-
-<file path="src/container/cleanup.rs">
-use std::{fs, path::PathBuf};
-
-use nix::{
-    sys::signal::{Signal, kill},
-    unistd::Pid,
-};
-
-use crate::{container::state::ContainerState, error::Result};
-
-pub struct ContainerCleanup {
-    pub container_id: String,
-    pub pid: Option<i32>,
-    pub cgroup_path: PathBuf,
-    pub state_dir: PathBuf,
-}
-
-impl ContainerCleanup {
-    /// Create new cleaner instance
-    pub fn new(container_id: &str, pid: Option<i32>) -> Self {
-        let cgroup_path = PathBuf::from("/sys/fs/cgroup/kuro").join(&container_id);
-        let state_dir = ContainerState::get_state_dir(&container_id);
-
-        Self {
-            container_id: container_id.to_string(),
-            pid,
-            cgroup_path,
-            state_dir,
-        }
-    }
-
-    /// Cleanup process
-    pub fn cleanup(&self) -> Result<()> {
-        println!("[kuro] Cleaning up container '{}'...", self.container_id);
-
-        // Force kill child processes if alive
-        if let Some(pid_raw) = self.pid {
-            // If pid is 0 or -1, do not kill (container not properly created)
-            if pid_raw != 0 || pid_raw != -1 {
-                let pid = Pid::from_raw(pid_raw);
-                // Send SIGKILL; ignore ESRCH error (process already dead)
-                let _ = kill(pid, Signal::SIGKILL);
-            }
-        }
-
-        // Remove cgroup directory
-        if self.cgroup_path.exists() {
-            if let Err(e) = fs::remove_dir(&self.cgroup_path) {
-                eprintln!(
-                    "[kuro] WARN: Failed to remove cgroup path {:?}: {}",
-                    self.cgroup_path, e
-                );
-            }
-        }
-
-        // Remove state directory
-        if self.state_dir.exists() {
-            if let Err(e) = fs::remove_dir_all(&self.state_dir) {
-                eprintln!(
-                    "[kuro] WARN: Failed to remove state diirectory {:?}: {}",
-                    self.state_dir, e
-                );
-            }
-        }
-
-        Ok(())
-    }
 }
 </file>
 
@@ -465,103 +380,19 @@ impl TermMgr {
 }
 </file>
 
-<file path="src/sync/pipe.rs">
-use std::os::fd::{AsFd, OwnedFd};
+<file path="DOC.md">
+### &Option<_>
+- &Option<> is bad. Its lifetime gets over when the line getting that value is done executing.
+- Fix: Use .as_ref() to convert &Option<_> into Option<&_>.
 
-use nix::{
-    fcntl::OFlag,
-    unistd::{pipe2, read, write},
-};
+### uid/gid helpers
+- setuidmap/setgidmap: Helper binaries with necessary capabilities enabled (SETUID/SETGID)
+- setuid/setgid: When ran on unprivileged process, or going from root to dropping root privileges, sets all three (real, effective, saved set) uid/gid
+- setresuid/setresgid: Explicitly sets real, effective, saved set uid/gid
 
-use crate::error::{KuroError, Result};
-
-/// Bi-directional sync pipe for host <-> container
-pub struct SyncPipe {
-    read_fd: OwnedFd,
-    write_fd: OwnedFd,
-}
-
-impl SyncPipe {
-    /// Create new pipe with O_CLOEXEC (automatically closed on execve)
-    pub fn new() -> Result<Self> {
-        let (read_fd, write_fd) = pipe2(OFlag::O_CLOEXEC)
-            .map_err(|e| KuroError::SyncPipe(format!("Failed to create pipe: {}", e)))?;
-
-        Ok(Self { read_fd, write_fd })
-    }
-
-    /// Send a 1-byte signal
-    pub fn send_signal(&self) -> Result<()> {
-        let buf = [1u8];
-        write(self.write_fd.as_fd(), &buf)
-            .map_err(|e| KuroError::SyncPipe(format!("Failed to send sync signal: {}", e)))?;
-
-        Ok(())
-    }
-
-    /// Wait until a 1-byte signal is received
-    pub fn wait_for_signal(&self) -> Result<()> {
-        let mut buf = [0u8; 1];
-        let bytes_read = read(self.read_fd.as_fd(), &mut buf)
-            .map_err(|e| KuroError::SyncPipe(format!("Failed to read sync signal: {}", e)))?;
-
-        if bytes_read == 0 {
-            return Err(KuroError::SyncPipe(
-                "Sync pipe closed unexpectedly before receiving signal".to_string(),
-            ));
-        }
-
-        Ok(())
-    }
-}
-</file>
-
-<file path="BUGS.md">
-# Initial Run (Sep 16, 2026)
-
-## Run 1
-
-### Test Environment
-- Rootfs: local `./alpinefs/`
-- Command: `kuro create alp-test ./alpinefs`
-
-### Logs
-```sh
-[kuro-host] Spawned container init process with PID: 31012
-[kuro-child] Error during initialization: Mount error: Failed to unmount /old_root: EINVAL: Invalid argument
-```
-
-## Run 2
-
-### Test Environment
-- Rootfs: `./alpinefs/`
-- Command: `kuro state alp-test`
-
-### Logs
-```sh
-{
-  "ociVersion": "1.3.0",
-  "id": "alp-test",
-  "status": "created",
-  "pid": -1,
-  "bundle": "/home/aether/Projects/kuro/alpinefs",
-  "annotations": {}
-}
-```
-
-## Run 3
-
-### Test Env
-- Rootfs: ./alpinefs/
-- Command: kuro delete alp-test
-
-### Output
-Crashes the entire fking system. Crashed all processes, turned off my hyprland session, logged me out, and took me back to the login screen sddm.
-
-#### Insights
-- Status is created, but it hasn't setup properly. Probably order of updating state in create() is messed up.
-- Check about how I solved EINVAL error before during mini-runtime build.
-- pivot_root() has "." currently, try changing it to `&root` or `&rootfs` (whatever the variable name)
+### kill()
+- Sending kill signal to pid=0 sends signal to every process in the caller's process group
+- Sending kill signal to pid=-1 sends signal to every single process on the system that the user has permission to kill (so as sudo, every process ever)
 </file>
 
 <file path="src/cgroups/mod.rs">
@@ -747,261 +578,75 @@ impl CgroupMgr {
 pub mod spec;
 </file>
 
-<file path="src/namespaces/mount.rs">
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+<file path="src/container/cleanup.rs">
+use std::{fs, path::PathBuf};
 
 use nix::{
-    mount::{MntFlags, MsFlags, mount, umount2},
-    unistd::{chdir, pivot_root},
+    sys::signal::{Signal, kill},
+    unistd::{Pid, getpid},
 };
-use oci_spec::runtime::{Linux, Spec};
 
-use crate::error::{KuroError, Result};
+use crate::{container::state::ContainerState, error::Result};
 
-// [x]   Masked and readonly paths
+pub struct ContainerCleanup {
+    pub container_id: String,
+    pub pid: Option<i32>,
+    pub cgroup_path: PathBuf,
+    pub state_dir: PathBuf,
+}
 
-pub struct MountMgr;
+impl ContainerCleanup {
+    /// Create new cleaner instance
+    pub fn new(container_id: &str, pid: Option<i32>) -> Self {
+        let cgroup_path = PathBuf::from("/sys/fs/cgroup/kuro").join(&container_id);
+        let state_dir = ContainerState::get_state_dir(&container_id);
 
-impl MountMgr {
-    /// Setup new mount namespace
-    pub fn setup_mount(spec: &Spec, container_id: &str, bundle: &PathBuf) -> Result<()> {
-        Self::setup_overlayfs(&spec, container_id, bundle)?;
-        Self::mount_fs(&spec)?;
-
-        if let Some(linux) = spec.linux() {
-            Self::set_masked(&linux)?;
-            Self::set_readonly(&linux)?;
+        Self {
+            container_id: container_id.to_string(),
+            pid,
+            cgroup_path,
+            state_dir,
         }
-
-        Ok(())
     }
 
-    /// Setup overlayfs
-    fn setup_overlayfs(spec: &Spec, container_id: &str, bundle: &PathBuf) -> Result<()> {
-        // Define dir paths
-        let base = bundle.join(container_id);
-        let upper = base.join("upper");
-        let work = base.join("work");
-        let merged = base.join("merged");
-        let lower = if let Some(rootfs) = spec.root().as_ref() {
-            bundle.join(rootfs.path())
-        } else {
-            bundle.join("rootfs")
-        };
+    /// Cleanup process
+    pub fn cleanup(&self) -> Result<()> {
+        println!("[kuro] Cleaning up container '{}'...", self.container_id);
 
-        // Create the directories
-        fs::create_dir_all(&upper)?;
-        fs::create_dir_all(&merged)?;
-        fs::create_dir_all(&work)?;
+        // Force kill child processes if alive
+        if let Some(pid_raw) = self.pid {
+            let curpid = getpid().as_raw();
 
-        // Make mount propagation PRIVATE to prevent mounts leaking to host
-        mount(
-            None::<&str>,
-            "/",
-            None::<&str>,
-            MsFlags::MS_REC | MsFlags::MS_PRIVATE,
-            None::<&str>,
-        )
-        .map_err(|e| KuroError::MountFailed {
-            target: "/".to_string(),
-            source: e,
-        })?;
-
-        // Mount OverlayFS
-        let overlay_opts = format!(
-            "lowerdir={},upperdir={},workdir={}",
-            lower.display(),
-            upper.display(),
-            work.display()
-        );
-        mount(
-            Some("overlay"),
-            &merged,
-            Some("overlay"),
-            MsFlags::empty(),
-            Some(overlay_opts.as_str()),
-        )
-        .map_err(|e| KuroError::MountFailed {
-            target: "overlay".to_string(),
-            source: e,
-        })?;
-
-        // pivot_root into isolated mount space
-        Self::setup_pivot_root(&merged)?;
-
-        Ok(())
-    }
-
-    /// Setup pivot_root
-    fn setup_pivot_root(merged: &PathBuf) -> Result<()> {
-        // Get absolute path of root
-        let root = fs::canonicalize(&merged)?;
-        chdir(&root)
-            .map_err(|e| KuroError::Mount(format!("Failed to chdir to new root: {}", e)))?;
-
-        // Bind-mount root onto itself (pre-requisite for pivot_root)
-        mount(
-            Some(&root),
-            &root,
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_PRIVATE,
-            None::<&str>,
-        )
-        .map_err(|e| KuroError::MountFailed {
-            target: root.to_string_lossy().to_string(),
-            source: e,
-        })?;
-
-        // Handle old root safely
-        let old_root = root.join("old_root");
-        fs::create_dir_all(&old_root)?;
-        // WARN: If bugs arise, change "." to &root
-        pivot_root(&root, &old_root)
-            .map_err(|e| KuroError::Mount(format!("Failed to pivot root: {}", e)))?;
-
-        // Clean up old root
-        chdir("/")
-            .map_err(|e| KuroError::Mount(format!("Failed to change directory to '/': {}", e)))?;
-        umount2("/old_root", MntFlags::MNT_DETACH)
-            .map_err(|e| KuroError::Mount(format!("Failed to unmount /old_root: {}", e)))?;
-        fs::remove_dir("/old_root")?;
-
-        Ok(())
-    }
-
-    /// Mount filesystems given in config
-    fn mount_fs(spec: &Spec) -> Result<()> {
-        if let Some(mounts) = spec.mounts() {
-            for mnt in mounts {
-                // Ensure destination path
-                let dest = mnt.destination();
-                if !dest.exists() {
-                    fs::create_dir_all(&dest)?;
-                }
-
-                // Parse mount options
-                let opts = mnt.options().as_deref().unwrap_or(&[]);
-                let (flags, data) = Self::parse_mount_options(opts);
-                let data = if data.is_empty() {
-                    None
-                } else {
-                    Some(data.as_str())
-                };
-
-                // Convert OCI spec to syscall types
-                let source = mnt.source().as_deref();
-                let fstype = mnt.typ().as_deref();
-
-                mount(source, dest, fstype, flags, data)?;
+            // If pid is 0 or -1, do not kill (container not properly created)
+            if pid_raw > 1 && pid_raw != curpid {
+                let pid = Pid::from_raw(pid_raw);
+                // Send SIGKILL; ignore ESRCH error (process already dead)
+                let _ = kill(pid, Signal::SIGKILL);
+            } else {
+                eprintln!(
+                    "[kuro] WARN: Skipping kill for invalid or dangerous PID: {}",
+                    pid_raw
+                );
             }
         }
 
-        Ok(())
-    }
-
-    /// Parse mount options in OCI spec
-    fn parse_mount_options(options: &[String]) -> (MsFlags, String) {
-        let mut flags = MsFlags::empty();
-        let mut data_opts = Vec::new();
-
-        for opt in options {
-            match opt.as_str() {
-                "ro" => flags.insert(MsFlags::MS_RDONLY),
-                "nosuid" => flags.insert(MsFlags::MS_NOSUID),
-                "nodev" => flags.insert(MsFlags::MS_NODEV),
-                "noexec" => flags.insert(MsFlags::MS_NOEXEC),
-                "bind" => flags.insert(MsFlags::MS_BIND),
-                "rbind" => {
-                    flags.insert(MsFlags::MS_BIND);
-                    flags.insert(MsFlags::MS_REC);
-                }
-                "rec" => flags.insert(MsFlags::MS_REC),
-                "remount" => flags.insert(MsFlags::MS_REMOUNT),
-                "private" => flags.insert(MsFlags::MS_PRIVATE),
-                "slave" => flags.insert(MsFlags::MS_SLAVE),
-                "shared" => flags.insert(MsFlags::MS_SHARED),
-                other => data_opts.push(other),
+        // Remove cgroup directory
+        if self.cgroup_path.exists() {
+            if let Err(e) = fs::remove_dir(&self.cgroup_path) {
+                eprintln!(
+                    "[kuro] WARN: Failed to remove cgroup path {:?}: {}",
+                    self.cgroup_path, e
+                );
             }
         }
 
-        let data = data_opts.join(",");
-
-        (flags, data)
-    }
-
-    /// Set up readonly paths (RDONLY)
-    fn set_readonly(linux: &Linux) -> Result<()> {
-        if let Some(rdpaths) = linux.readonly_paths() {
-            for path in rdpaths {
-                // Mount as bind-mount
-                mount(
-                    Some(path.as_str()),
-                    path.as_str(),
-                    None::<&str>,
-                    MsFlags::MS_BIND | MsFlags::MS_REC,
-                    None::<&str>,
-                )
-                .map_err(|e| KuroError::MountFailed {
-                    target: path.to_owned(),
-                    source: e,
-                })?;
-                // Remount as read-only (RDONLY)
-                mount(
-                    None::<&str>,
-                    path.as_str(),
-                    None::<&str>,
-                    MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | MsFlags::MS_BIND | MsFlags::MS_REC,
-                    None::<&str>,
-                )
-                .map_err(|e| KuroError::MountFailed {
-                    target: path.to_owned(),
-                    source: e,
-                })?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Set up masked paths
-    fn set_masked(linux: &Linux) -> Result<()> {
-        if let Some(maskpaths) = linux.masked_paths() {
-            for path in maskpaths {
-                let path = Path::new(path);
-                if !path.exists() {
-                    continue;
-                }
-
-                if path.is_dir() {
-                    // If path is a directory, mask it over an empty read-only tmpfs directory
-                    mount(
-                        Some("tmpfs"),
-                        path,
-                        Some("tmpfs"),
-                        MsFlags::MS_RDONLY,
-                        Some("mode=000"),
-                    )
-                    .map_err(|e| KuroError::MountFailed {
-                        target: path.to_string_lossy().to_string(),
-                        source: e,
-                    })?;
-                } else {
-                    // If path is a file, bind-mount it over /dev/null
-                    mount(
-                        Some("/dev/null"),
-                        path,
-                        None::<&str>,
-                        MsFlags::MS_BIND,
-                        None::<&str>,
-                    )
-                    .map_err(|e| KuroError::MountFailed {
-                        target: path.to_string_lossy().to_string(),
-                        source: e,
-                    })?;
-                }
+        // Remove state directory
+        if self.state_dir.exists() {
+            if let Err(e) = fs::remove_dir_all(&self.state_dir) {
+                eprintln!(
+                    "[kuro] WARN: Failed to remove state diirectory {:?}: {}",
+                    self.state_dir, e
+                );
             }
         }
 
@@ -1177,7 +822,7 @@ impl ExecFifo {
         //     .map_err(|e| KuroError::SyncPipe(format!("Failed to open '{:?}': {}", &fifo_path, e)))
         OpenOptions::new()
             .read(true)
-            .custom_flags(O_NONBLOCK)
+            .write(true)
             .open(fifo_path)
             .map_err(|e| KuroError::SyncPipe(format!("Failed to open '{:?}': {}", &fifo_path, e)))
     }
@@ -1185,12 +830,12 @@ impl ExecFifo {
     /// Wait on already-opened file descriptor
     pub fn wait_for_start(fifo_file: File) -> Result<()> {
         // Clear O_NONBLOCK so read_exact() can now block
-        use std::os::unix::io::AsRawFd;
-        let fd = fifo_file.as_raw_fd();
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            libc::fcntl(fd, libc::F_SETFL, flags & !O_NONBLOCK);
-        }
+        // use std::os::unix::io::AsRawFd;
+        // let fd = fifo_file.as_raw_fd();
+        // unsafe {
+        //     let flags = libc::fcntl(fd, libc::F_GETFL);
+        //     libc::fcntl(fd, libc::F_SETFL, flags & !O_NONBLOCK);
+        // }
 
         let mut fifo_file = fifo_file;
         let mut buf = [0u8; 1];
@@ -1212,6 +857,124 @@ impl ExecFifo {
 
         Ok(())
     }
+}
+</file>
+
+<file path="src/sync/pipe.rs">
+use std::os::fd::{AsFd, OwnedFd};
+
+use nix::{
+    fcntl::OFlag,
+    unistd::{pipe2, read, write},
+};
+
+use crate::error::{KuroError, Result};
+
+pub enum SyncResult {
+    Ready,
+    Error(String),
+    Eof,
+}
+
+pub struct SyncPipe {
+    read_fd: OwnedFd,
+    write_fd: OwnedFd,
+}
+
+impl SyncPipe {
+    /// Create new pipe with O_CLOEXEC (automatically closed on execve)
+    pub fn new() -> Result<Self> {
+        let (read_fd, write_fd) = pipe2(OFlag::O_CLOEXEC)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to create pipe: {}", e)))?;
+
+        Ok(Self { read_fd, write_fd })
+    }
+
+    /// Send success signal (byte 1)
+    pub fn send_ready(&self) -> Result<()> {
+        let buf = [1u8];
+        write(self.write_fd.as_fd(), &buf)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to send ready signal: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Send error signal (byte 2 followed by 4-length header and UTF-8 string)
+    pub fn send_err(&self, emsg: &str) -> Result<()> {
+        let msg_bytes = emsg.as_bytes();
+        let mlen = msg_bytes.len() as u32;
+
+        let mut packet = Vec::with_capacity(1 + 4 + msg_bytes.len());
+        packet.push(2u8);
+        packet.extend_from_slice(&mlen.to_be_bytes());
+        packet.extend_from_slice(msg_bytes);
+
+        write(self.write_fd.as_fd(), &packet)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to send error signal: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Wait until a 1-byte signal is received
+    pub fn wait_for_signal(&self) -> Result<SyncResult> {
+        let mut flag_buf = [0u8; 1];
+        let bytes_read = match read(self.read_fd.as_fd(), &mut flag_buf) {
+            Ok(n) => n,
+            Err(e) => {
+                return Err(KuroError::SyncPipe(format!(
+                    "Failed to read sync signal: {}",
+                    e
+                )));
+            }
+        };
+
+        if bytes_read == 0 {
+            return Ok(SyncResult::Eof);
+        }
+
+        match flag_buf[0] {
+            1 => Ok(SyncResult::Ready),
+            2 => {
+                let mut len_buf = [0u8; 4];
+                read_exact_fd(self.read_fd.as_fd(), &mut len_buf)?;
+                let mlen = u32::from_be_bytes(len_buf) as usize;
+
+                let mut msg_bytes = vec![0u8; mlen];
+                read_exact_fd(self.read_fd.as_fd(), &mut msg_bytes)?;
+
+                let emsg = String::from_utf8_lossy(&msg_bytes).to_string();
+                Ok(SyncResult::Error(emsg))
+            }
+            unknown => Err(KuroError::SyncPipe(format!(
+                "Received invalid status code from sync pipe: {}",
+                unknown
+            ))),
+        }
+    }
+}
+
+fn read_exact_fd(fd: std::os::fd::BorrowedFd, mut buf: &mut [u8]) -> Result<()> {
+    while !buf.is_empty() {
+        match read(fd, buf) {
+            Ok(0) => {
+                return Err(KuroError::SyncPipe(
+                    "Unexpected EOF while reading error payload from sync pipe".to_string(),
+                ));
+            }
+            Ok(n) => {
+                let tmp = buf;
+                buf = &mut tmp[n..];
+            }
+            Err(e) => {
+                return Err(KuroError::SyncPipe(format!(
+                    "Failed to read from pipe: {}",
+                    e
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 </file>
 
@@ -1565,9 +1328,103 @@ pub mod fifo;
 pub mod pipe;
 </file>
 
-<file path=".gitignore">
-/target
-/alpinefs
+<file path="BUGS.md">
+# Initial Run (Sep 16, 2026)
+
+## Run 1
+
+### Test Environment
+- Rootfs: local `./alpinefs/`
+- Command: `kuro create alp-test ./alpinefs`
+
+### Logs
+```sh
+[kuro-host] Spawned container init process with PID: 6553
+[kuro] Error during initialization: Mount failed for target '/dev': EINVAL: Invalid argument
+```
+
+## Run 2
+
+### Test Environment
+- Rootfs: `./alpinefs/`
+- Command: `kuro state alp-test`
+
+### Logs
+```sh
+{
+  "ociVersion": "1.3.0",
+  "id": "alp-test",
+  "status": "created",
+  "pid": -1,
+  "bundle": "/home/aether/Projects/kuro/alpinefs",
+  "annotations": {}
+}
+```
+
+## Run 4
+
+### Test Env
+- Rootfs: ./alpinefs/
+- Command: kuro create alp-test ./alpinefs
+
+### Logs
+```sh
+[kuro-host] Spawned container init process with PID: 9968
+[kuro] Error during initialization: Mount failed for target '/sys/fs/cgroup': EPERM: Operation not permitted
+[kuro] Command execution failed: Child initialization failed: Mount failed for target '/sys/fs/cgroup': EPERM: Operation not permitted
+[kuro] Cleaning up container 'alp-test'...
+[kuro] WARN: Failed to remove cgroup path "/sys/fs/cgroup/kuro/alp-test": Device or resource busy (os error 16)
+Error: ExecFailed("Child initialization failed: Mount failed for target '/sys/fs/cgroup': EPERM: Operation not permitted")
+```
+
+## Run 5
+
+### Test Env
+- Rootfs: ./alpinefs/
+- Command: kuro create alp-test ./alpinefs
+
+### Logs
+```sh
+[kuro-host] Spawned container init process with PID: 11995
+[kuro] Error during initialization: Mount failed for target '/dev/mqueue': EBUSY: Device or resource busy
+[kuro] Command execution failed: Child initialization failed: Mount failed for target '/dev/mqueue': EBUSY: Device or resource busy
+[kuro] Cleaning up container 'alp-test'...
+[kuro] WARN: Failed to remove cgroup path "/sys/fs/cgroup/kuro/alp-test": Device or resource busy (os error 16)
+Error: ExecFailed("Child initialization failed: Mount failed for target '/dev/mqueue': EBUSY: Device or resource busy")
+```
+
+## Run 6
+
+### Test env
+- Rootfs: ./alpinefs
+- Command: kuro start alp-test
+
+### Logs
+```sh
+state loaded
+spec loaded
+signal sent
+status saved
+Started container alp-test...
+```
+
+#### Insights
+- Start command logs properly and starts container, but command (here, 'sh') doesn't appear on terminal (probably issue with attaching stdin/stdout/stder). Status = stopped (was 'created' before this).
+
+
+# Fixed Bugs
+- Cleanup kills every single process
+- EPERM mount, invalid "/old_root" (replaced "." with &root)
+- Container state being "created" even though it wasn't
+- Child hangs on setup error because parent keeps listening for signal that'll never arrive
+- Mount error, not able to mount /dev device with EINVAL
+- Mount error, /sys/fs/cgroup/ EPERM Operation Not Permitted
+- Mount error, /dev/mqueue/ EBUSY Device or resource busy
+- Mount error, /dev/null no such file or directory (during masked path /proc/kcore)
+- Start command does not do anything
+  - Looks like container process dies after create command finishes.
+  - But that's pure coincidence of timing. Actual issue is related to the named pipe (fifo).
+  - It opens the file as read-only, and at that moment the writer count on it is 0. When later called a read(), rule is if there are currently 0 writers open, read() returns 0 (EOF) immediately. Clearing NONBLOCK doesn't matter.
 </file>
 
 <file path="Cargo.toml">
@@ -1598,6 +1455,358 @@ syscallz = "0.17.0"
 thiserror = "2.0.20"
 </file>
 
+<file path="src/namespaces/mount.rs">
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use nix::{
+    mount::{MntFlags, MsFlags, mount, umount2},
+    unistd::{chdir, pivot_root},
+};
+use oci_spec::runtime::{Linux, Spec};
+
+use crate::error::{KuroError, Result};
+
+// [x]   Masked and readonly paths
+
+pub struct MountMgr;
+
+impl MountMgr {
+    /// Setup new mount namespace
+    pub fn setup_mount(spec: &Spec, container_id: &str, bundle: &PathBuf) -> Result<()> {
+        Self::setup_overlayfs(&spec, container_id, bundle)?;
+        Self::mount_fs(&spec)?;
+
+        // if let Some(linux) = spec.linux() {
+        //     Self::set_masked(&linux)?;
+        //     Self::set_readonly(&linux)?;
+        // }
+
+        Ok(())
+    }
+
+    /// Setup overlayfs
+    fn setup_overlayfs(spec: &Spec, container_id: &str, bundle: &PathBuf) -> Result<()> {
+        // Define dir paths
+        let base = bundle.join(container_id);
+        let upper = base.join("upper");
+        let work = base.join("work");
+        let merged = base.join("merged");
+        let lower = if let Some(rootfs) = spec.root().as_ref() {
+            bundle.join(rootfs.path())
+        } else {
+            bundle.join("rootfs")
+        };
+
+        // Create the directories
+        fs::create_dir_all(&upper)?;
+        fs::create_dir_all(&merged)?;
+        fs::create_dir_all(&work)?;
+
+        // Make mount propagation PRIVATE to prevent mounts leaking to host
+        mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+            None::<&str>,
+        )
+        .map_err(|e| KuroError::MountFailed {
+            target: "/".to_string(),
+            source: e,
+        })?;
+
+        // Mount OverlayFS
+        let overlay_opts = format!(
+            "lowerdir={},upperdir={},workdir={}",
+            lower.display(),
+            upper.display(),
+            work.display()
+        );
+        mount(
+            Some("overlay"),
+            &merged,
+            Some("overlay"),
+            MsFlags::empty(),
+            Some(overlay_opts.as_str()),
+        )
+        .map_err(|e| KuroError::MountFailed {
+            target: "overlay".to_string(),
+            source: e,
+        })?;
+
+        // pivot_root into isolated mount space
+        Self::setup_pivot_root(&merged)?;
+
+        Ok(())
+    }
+
+    /// Setup pivot_root
+    fn setup_pivot_root(merged: &PathBuf) -> Result<()> {
+        // Get absolute path of root
+        let root = fs::canonicalize(&merged)?;
+        chdir(&root)
+            .map_err(|e| KuroError::Mount(format!("Failed to chdir to new root: {}", e)))?;
+
+        // Bind-mount root onto itself (pre-requisite for pivot_root)
+        mount(
+            Some(&root),
+            &root,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+            None::<&str>,
+        )
+        .map_err(|e| KuroError::MountFailed {
+            target: root.to_string_lossy().to_string(),
+            source: e,
+        })?;
+
+        // Handle old root safely
+        let old_root = root.join("old_root");
+        fs::create_dir_all(&old_root)?;
+        // WARN: If bugs arise, change "." to &root
+        pivot_root(&root, &old_root)
+            .map_err(|e| KuroError::Mount(format!("Failed to pivot root: {}", e)))?;
+
+        // Clean up old root
+        chdir("/")
+            .map_err(|e| KuroError::Mount(format!("Failed to change directory to '/': {}", e)))?;
+        umount2("/old_root", MntFlags::MNT_DETACH)
+            .map_err(|e| KuroError::Mount(format!("Failed to unmount /old_root: {}", e)))?;
+        fs::remove_dir("/old_root")?;
+
+        Ok(())
+    }
+
+    /// Mount filesystems given in config
+    fn mount_fs(spec: &Spec) -> Result<()> {
+        if let Some(mounts) = spec.mounts() {
+            for mnt in mounts {
+                let dest = mnt.destination();
+
+                // If /sys was already mounted as read-only, creating /sys/fs/cgroup will fail
+                // So we ensure parent directory exists before mounting
+                // if let Some(parent) = dest.parent() {
+                //     if !parent.exists() {
+                //         let _ = fs::create_dir_all(parent);
+                //     }
+                // }
+
+                // Ensure destination path exists
+                if !dest.exists() {
+                    fs::create_dir_all(&dest)?;
+                }
+
+                // Parse mount options
+                let opts = mnt.options().as_deref().unwrap_or(&[]);
+                let (flags, data) = Self::parse_mount_options(opts);
+                let data = if data.is_empty() {
+                    None
+                } else {
+                    Some(data.as_str())
+                };
+
+                // Convert OCI spec to syscall types
+                let source = mnt.source().as_deref();
+                let mut fstype = mnt.typ().as_deref();
+
+                // cgroup mount (special case)
+                if fstype == Some("cgroup") {
+                    if Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+                        || Path::new("/sys/fs/cgroup/").exists()
+                    {
+                        fstype = Some("cgroup2");
+                    }
+                }
+
+                // Check if bind mount
+                let is_bind = flags.contains(MsFlags::MS_BIND);
+
+                if is_bind {
+                    // Bind mount
+                    // Perform bind mount first
+                    let bind_flags = if flags.contains(MsFlags::MS_REC) {
+                        MsFlags::MS_BIND | MsFlags::MS_REC
+                    } else {
+                        MsFlags::MS_BIND
+                    };
+                    mount(source, dest, fstype, bind_flags, None::<&str>).map_err(|e| {
+                        KuroError::MountFailed {
+                            target: dest.to_string_lossy().to_string(),
+                            source: e,
+                        }
+                    })?;
+
+                    // Apply attribute flags
+                    let attr_flags = flags & !MsFlags::MS_REC;
+                    if !attr_flags.is_empty() && attr_flags != MsFlags::MS_BIND {
+                        let remount_flags = attr_flags | MsFlags::MS_REMOUNT | MsFlags::MS_BIND;
+                        mount(
+                            None::<&str>,
+                            dest,
+                            None::<&str>,
+                            remount_flags,
+                            None::<&str>,
+                        )
+                        .map_err(|e| KuroError::MountFailed {
+                            target: dest.to_string_lossy().to_string(),
+                            source: e,
+                        })?;
+                    }
+                } else {
+                    // Regular mount
+                    // mount(source, dest, fstype, flags, data).map_err(|e| {
+                    //     KuroError::MountFailed {
+                    //         target: dest.to_string_lossy().to_string(),
+                    //         source: e,
+                    //     }
+                    // })?;
+
+                    if let Err(e) = mount(source, dest, fstype, flags, data) {
+                        if fstype == Some("cgroup") || fstype == Some("cgroup2") {
+                            mount(
+                                Some("/sys/fs/cgroup/"),
+                                dest,
+                                None::<&str>,
+                                MsFlags::MS_BIND | MsFlags::MS_REC | flags,
+                                None::<&str>,
+                            )
+                            .map_err(|be| KuroError::MountFailed {
+                                target: dest.to_string_lossy().to_string(),
+                                source: be,
+                            })?;
+                        } else {
+                            return Err(KuroError::MountFailed {
+                                target: dest.to_string_lossy().to_string(),
+                                source: e,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Parse mount options in OCI spec
+    fn parse_mount_options(options: &[String]) -> (MsFlags, String) {
+        let mut flags = MsFlags::empty();
+        let mut data_opts = Vec::new();
+
+        for opt in options {
+            match opt.as_str() {
+                "ro" => flags.insert(MsFlags::MS_RDONLY),
+                "nosuid" => flags.insert(MsFlags::MS_NOSUID),
+                "nodev" => flags.insert(MsFlags::MS_NODEV),
+                "noexec" => flags.insert(MsFlags::MS_NOEXEC),
+                "bind" => flags.insert(MsFlags::MS_BIND),
+                "rbind" => {
+                    flags.insert(MsFlags::MS_BIND);
+                    flags.insert(MsFlags::MS_REC);
+                }
+                "rec" => flags.insert(MsFlags::MS_REC),
+                "remount" => flags.insert(MsFlags::MS_REMOUNT),
+                "private" => flags.insert(MsFlags::MS_PRIVATE),
+                "slave" => flags.insert(MsFlags::MS_SLAVE),
+                "shared" => flags.insert(MsFlags::MS_SHARED),
+                "strictatime" => flags.insert(MsFlags::MS_STRICTATIME),
+                "relatime" => flags.insert(MsFlags::MS_RELATIME),
+                "silent" => flags.insert(MsFlags::MS_SILENT),
+                other => data_opts.push(other),
+            }
+        }
+
+        let data = data_opts.join(",");
+
+        (flags, data)
+    }
+
+    /// Set up readonly paths (RDONLY)
+    pub fn set_readonly(linux: &Linux) -> Result<()> {
+        if let Some(rdpaths) = linux.readonly_paths() {
+            for path in rdpaths {
+                let ppath = Path::new(path);
+                if !ppath.exists() {
+                    continue;
+                }
+
+                // Mount as bind-mount
+                mount(
+                    Some(path.as_str()),
+                    path.as_str(),
+                    None::<&str>,
+                    MsFlags::MS_BIND | MsFlags::MS_REC,
+                    None::<&str>,
+                )
+                .map_err(|e| KuroError::MountFailed {
+                    target: path.to_owned(),
+                    source: e,
+                })?;
+                // Remount as read-only (RDONLY)
+                mount(
+                    None::<&str>,
+                    path.as_str(),
+                    None::<&str>,
+                    MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | MsFlags::MS_BIND | MsFlags::MS_REC,
+                    None::<&str>,
+                )
+                .map_err(|e| KuroError::MountFailed {
+                    target: path.to_owned(),
+                    source: e,
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Set up masked paths
+    pub fn set_masked(linux: &Linux) -> Result<()> {
+        if let Some(maskpaths) = linux.masked_paths() {
+            for path in maskpaths {
+                let path = Path::new(path);
+                if !path.exists() {
+                    continue;
+                }
+
+                if path.is_dir() {
+                    // If path is a directory, mask it over an empty read-only tmpfs directory
+                    mount(
+                        Some("tmpfs"),
+                        path,
+                        Some("tmpfs"),
+                        MsFlags::MS_RDONLY,
+                        Some("mode=000"),
+                    )
+                    .map_err(|e| KuroError::MountFailed {
+                        target: path.to_string_lossy().to_string(),
+                        source: e,
+                    })?;
+                } else {
+                    // If path is a file, bind-mount it over /dev/null
+                    mount(
+                        Some("/dev/null"),
+                        path,
+                        None::<&str>,
+                        MsFlags::MS_BIND,
+                        None::<&str>,
+                    )
+                    .map_err(|e| KuroError::MountFailed {
+                        target: path.to_string_lossy().to_string(),
+                        source: e,
+                    })?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+</file>
+
 <file path="src/main.rs">
 use clap::Parser;
 
@@ -1623,6 +1832,11 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+</file>
+
+<file path=".gitignore">
+/target
+/alpinefs
 </file>
 
 <file path="src/namespaces/mod.rs">
@@ -1744,16 +1958,26 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
                     &container_id, state.status
                 )));
             }
+            if state.pid < 2 {
+                return Err(KuroError::Start(format!(
+                    "Container '{}' has not been created properly, and has no PID (check by running 'kuro state')",
+                    &container_id
+                )));
+            }
+            println!("state loaded");
 
             let spec = load_spec(&PathBuf::from(&state.bundle))?;
+            println!("spec loaded");
 
             // Signal PID 1 to start container
             let state_dir = ContainerState::get_state_dir(&container_id);
             ExecFifo::signal_start(&state_dir)?;
+            println!("signal sent");
 
             // Update status -> Running
             state.status = ContainerStatus::Running;
             state.save()?;
+            println!("status saved");
 
             // [x]   Execute poststart hooks (runtime)
             CBuilder::run_hook(&spec, &container_id, "poststart")?;
@@ -1977,7 +2201,10 @@ use crate::{
     devices::{devices::DevMgr, terminal::TermMgr},
     error::{KuroError, Result},
     namespaces::{mount::MountMgr, netns::NetMgr, security::SecMgr, userns::UserMgr},
-    sync::{fifo::ExecFifo, pipe::SyncPipe},
+    sync::{
+        fifo::ExecFifo,
+        pipe::{SyncPipe, SyncResult},
+    },
 };
 use nix::{
     sched::{CloneFlags, clone, setns},
@@ -2045,21 +2272,26 @@ impl<'a> CBuilder<'a> {
         let clone_flags = self.get_clone_flags()?;
 
         // Prepare child stack
-        let mut stk = vec![0u8; STACK_SIZE];
+        let mut stk = vec![0u8; STACK_SIZE].into_boxed_slice();
+        // let stk_ptr = Box::into_raw(stk);
 
         // Closure executed in child process
         let child_fn = Box::new(|| -> isize {
             match self.run_child_init(&child_to_parent, &parent_to_child) {
                 Ok(_) => 0,
                 Err(e) => {
-                    eprintln!("[kuro-child] Error during initialization: {}", e);
-                    1
+                    eprintln!("[kuro] Error during initialization: {}", e);
+                    std::process::exit(1);
                 }
             }
         });
 
         // Clone the process into new namespaces
         let child_pid = unsafe {
+            // let stk_top = (*stk_ptr).as_mut_ptr().add(STACK_SIZE);
+            // let stk_slice: &mut [u8] =
+            //     std::slice::from_raw_parts_mut(stk_ptr as *mut u8, STACK_SIZE);
+
             clone(
                 child_fn,
                 &mut stk,
@@ -2107,25 +2339,54 @@ impl<'a> CBuilder<'a> {
         // [x]   createRuntime hooks
 
         // Signal child that host setup is done
-        parent_to_child.send_signal()?;
+        parent_to_child.send_ready()?;
 
         // Wait for child to ack rootfs + security setup
-        child_to_parent.wait_for_signal()?;
+        match child_to_parent.wait_for_signal()? {
+            SyncResult::Ready => {}
+            SyncResult::Error(msg) => {
+                return Err(KuroError::ExecFailed(format!(
+                    "Child initialization failed: {}",
+                    msg
+                )));
+            }
+            SyncResult::Eof => {
+                return Err(KuroError::ExecFailed(
+                    "Child died unexpectedly before setup completion".to_string(),
+                ));
+            }
+        }
+        println!("child returned signal");
 
         // Update and save state (status = Created)
         let mut state = ContainerState::load(&self.container_id)?;
         state.status = ContainerStatus::Created;
+        state.pid = i32::from(child_pid);
         state.save()?;
+        println!("state updated from host");
 
         // Child setup completed; can run hooks now
         Self::run_hook(&self.spec, &self.container_id, "prestart")?;
         Self::run_hook(&self.spec, &self.container_id, "createRuntime")?;
 
         // Signal child that parent has run hooks
-        parent_to_child.send_signal()?;
+        parent_to_child.send_ready()?;
 
         // Wait for child to run their hooks
-        child_to_parent.wait_for_signal()?;
+        match child_to_parent.wait_for_signal()? {
+            SyncResult::Ready => {}
+            SyncResult::Error(msg) => {
+                return Err(KuroError::ExecFailed(format!(
+                    "Child failed while running hooks: {}",
+                    msg
+                )));
+            }
+            SyncResult::Eof => {
+                return Err(KuroError::ExecFailed(
+                    "Child died unexpectedly while running hooks".to_string(),
+                ));
+            }
+        }
 
         Ok(child_pid)
     }
@@ -2186,58 +2447,81 @@ impl<'a> CBuilder<'a> {
     /// Child container execution (Level 2)
     fn run_child_init(&self, child_to_parent: &SyncPipe, parent_to_child: &SyncPipe) -> Result<()> {
         // Wait for host to complete setup
-        parent_to_child.wait_for_signal()?;
+        match parent_to_child.wait_for_signal()? {
+            SyncResult::Ready => {}
+            SyncResult::Error(msg) => {
+                return Err(KuroError::ExecFailed(format!("Host setup failed: {}", msg)));
+            }
+            SyncResult::Eof => {
+                return Err(KuroError::ExecFailed(
+                    "Host exited unexpectedly before signalling child".to_string(),
+                ));
+            }
+        }
 
         // Open FIFO pipe file and acquire file descriptor
         let state_dir = ContainerState::get_state_dir(&self.container_id);
         let fifo_path = ExecFifo::init(&state_dir)?;
         let fifo = ExecFifo::open_for_read(&fifo_path)?;
+        println!("opened fifo pipe");
 
-        // Handle all namespaces
-        if let Some(linux) = self.spec.linux() {
-            if let Some(namespaces) = linux.namespaces() {
-                for ns in namespaces {
-                    Self::setup_ns(ns.typ(), ns.path().as_ref())?;
+        let setup_child = (|| -> Result<()> {
+            // Handle all namespaces
+            if let Some(linux) = self.spec.linux() {
+                if let Some(namespaces) = linux.namespaces() {
+                    for ns in namespaces {
+                        Self::setup_ns(ns.typ(), ns.path().as_ref())?;
+                    }
                 }
             }
-        }
 
-        // Set hostname
-        if let Some(hostname) = self.spec.hostname() {
-            sethostname(hostname).map_err(|e| {
-                KuroError::Namespace(format!("Failed to set hostname '{}': {}", hostname, e))
-            })?;
-        }
+            // Set hostname
+            if let Some(hostname) = self.spec.hostname() {
+                sethostname(hostname).map_err(|e| {
+                    KuroError::Namespace(format!("Failed to set hostname '{}': {}", hostname, e))
+                })?;
+            }
 
-        // Setup mounts, pivot_root, and masked/readonly paths
-        MountMgr::setup_mount(self.spec, &self.container_id, &self.bundle_path)?;
+            // Setup mounts, pivot_root, and masked/readonly paths
+            MountMgr::setup_mount(self.spec, &self.container_id, &self.bundle_path)?;
 
-        // Create device nodes and symlinks
-        let dev_spec = self
-            .spec
-            .linux()
-            .as_ref()
-            .and_then(|l| l.devices().as_deref());
-        DevMgr::create_devices(dev_spec)?;
+            // Create device nodes and symlinks
+            let dev_spec = self
+                .spec
+                .linux()
+                .as_ref()
+                .and_then(|l| l.devices().as_deref());
+            DevMgr::create_devices(dev_spec)?;
 
-        // Apply device cgroup rules
-        if let Some(linux) = self.spec.linux() {
-            if let Some(rsrcs) = linux.resources() {
-                if let Some(dev_rules) = rsrcs.devices() {
-                    let cgroup_path = PathBuf::from("/sys/fs/cgroup/kuro").join(&self.container_id);
-                    CgroupMgr::apply_device_rules(&cgroup_path, dev_rules)?;
+            // Apply device cgroup rules
+            if let Some(linux) = self.spec.linux() {
+                if let Some(rsrcs) = linux.resources() {
+                    if let Some(dev_rules) = rsrcs.devices() {
+                        let cgroup_path =
+                            PathBuf::from("/sys/fs/cgroup/kuro").join(&self.container_id);
+                        CgroupMgr::apply_device_rules(&cgroup_path, dev_rules)?;
+                    }
                 }
             }
-        }
 
-        // Handle interactive terminal (PTY)
-        let interactive = self
-            .spec
-            .process()
-            .as_ref()
-            .and_then(|p| p.terminal())
-            .unwrap_or(false);
-        let _master_fd = TermMgr::setup_terminal(interactive)?;
+            // Apply masked and readonly paths
+            if let Some(linux) = self.spec.linux() {
+                MountMgr::set_masked(&linux)?;
+                MountMgr::set_readonly(&linux)?;
+            }
+
+            // Handle interactive terminal (PTY)
+            let interactive = self
+                .spec
+                .process()
+                .as_ref()
+                .and_then(|p| p.terminal())
+                .unwrap_or(false);
+            let _master_fd = TermMgr::setup_terminal(interactive)?;
+
+            Ok(())
+        })();
+        println!("setup fn called");
 
         // [x]   Setup hostname
         // [x]   Mount filesystems and pivot_root
@@ -2245,23 +2529,47 @@ impl<'a> CBuilder<'a> {
         // [x]   Apply capabilities, rlimits, env vars, no_new_privs
         // [x]   createContainer hooks
 
+        if let Err(e) = setup_child {
+            let _ = child_to_parent.send_err(&e.to_string());
+            return Err(e);
+        }
+        println!("setup fn wasnt error");
+
         // Signal parent that container setup is ready
-        child_to_parent.send_signal()?;
+        child_to_parent.send_ready()?;
+        println!("sent signal to host that child setup done");
 
         // Wait for parent to run hooks
-        parent_to_child.wait_for_signal()?;
+        match parent_to_child.wait_for_signal()? {
+            SyncResult::Ready => {}
+            SyncResult::Error(msg) => {
+                return Err(KuroError::ExecFailed(format!(
+                    "Host failed hook execution: {}",
+                    msg
+                )));
+            }
+            SyncResult::Eof => {
+                return Err(KuroError::ExecFailed(
+                    "Host process exited before completing hooks".to_string(),
+                ));
+            }
+        }
 
         // Parent has run hooks, now child will run hook
-        Self::run_hook(&self.spec, &self.container_id, "createContainer")?;
+        if let Err(e) = Self::run_hook(&self.spec, &self.container_id, "createContainer") {
+            let _ = child_to_parent.send_err(&e.to_string());
+            return Err(e);
+        }
 
         // Signal parent that child is ready and paused
-        child_to_parent.send_signal()?;
+        child_to_parent.send_ready()?;
 
         // [x]   Pause for 'kuro start' signal
         println!("[kuro] Container initialized and paused, ready to start");
         ExecFifo::wait_for_start(fifo)?;
 
         // Unblocked -> Call start method
+        println!("unblocked child");
         Self::run_hook(&self.spec, &self.container_id, "startContainer")?;
         Self::start(&self.spec)?;
 

@@ -109,16 +109,26 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
                     &container_id, state.status
                 )));
             }
+            if state.pid < 2 {
+                return Err(KuroError::Start(format!(
+                    "Container '{}' has not been created properly, and has no PID (check by running 'kuro state')",
+                    &container_id
+                )));
+            }
+            println!("state loaded");
 
             let spec = load_spec(&PathBuf::from(&state.bundle))?;
+            println!("spec loaded");
 
             // Signal PID 1 to start container
             let state_dir = ContainerState::get_state_dir(&container_id);
             ExecFifo::signal_start(&state_dir)?;
+            println!("signal sent");
 
             // Update status -> Running
             state.status = ContainerStatus::Running;
             state.save()?;
+            println!("status saved");
 
             // [x]   Execute poststart hooks (runtime)
             CBuilder::run_hook(&spec, &container_id, "poststart")?;

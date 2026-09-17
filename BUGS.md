@@ -70,11 +70,15 @@ Error: ExecFailed("Child initialization failed: Mount failed for target '/dev/mq
 
 ### Logs
 ```sh
-# nothing
+state loaded
+spec loaded
+signal sent
+status saved
+Started container alp-test...
 ```
 
 #### Insights
-- Start command does not do anything (no logs too)
+- Start command logs properly and starts container, but command (here, 'sh') doesn't appear on terminal (probably issue with attaching stdin/stdout/stder). Status = stopped (was 'created' before this).
 
 
 # Fixed Bugs
@@ -86,3 +90,7 @@ Error: ExecFailed("Child initialization failed: Mount failed for target '/dev/mq
 - Mount error, /sys/fs/cgroup/ EPERM Operation Not Permitted
 - Mount error, /dev/mqueue/ EBUSY Device or resource busy
 - Mount error, /dev/null no such file or directory (during masked path /proc/kcore)
+- Start command does not do anything
+  - Looks like container process dies after create command finishes.
+  - But that's pure coincidence of timing. Actual issue is related to the named pipe (fifo).
+  - It opens the file as read-only, and at that moment the writer count on it is 0. When later called a read(), rule is if there are currently 0 writers open, read() returns 0 (EOF) immediately. Clearing NONBLOCK doesn't matter.
