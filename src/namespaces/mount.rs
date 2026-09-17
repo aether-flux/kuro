@@ -21,10 +21,10 @@ impl MountMgr {
         Self::setup_overlayfs(&spec, container_id, bundle)?;
         Self::mount_fs(&spec)?;
 
-        if let Some(linux) = spec.linux() {
-            Self::set_masked(&linux)?;
-            Self::set_readonly(&linux)?;
-        }
+        // if let Some(linux) = spec.linux() {
+        //     Self::set_masked(&linux)?;
+        //     Self::set_readonly(&linux)?;
+        // }
 
         Ok(())
     }
@@ -126,8 +126,17 @@ impl MountMgr {
     fn mount_fs(spec: &Spec) -> Result<()> {
         if let Some(mounts) = spec.mounts() {
             for mnt in mounts {
-                // Ensure destination path
                 let dest = mnt.destination();
+
+                // If /sys was already mounted as read-only, creating /sys/fs/cgroup will fail
+                // So we ensure parent directory exists before mounting
+                // if let Some(parent) = dest.parent() {
+                //     if !parent.exists() {
+                //         let _ = fs::create_dir_all(parent);
+                //     }
+                // }
+
+                // Ensure destination path exists
                 if !dest.exists() {
                     fs::create_dir_all(&dest)?;
                 }
@@ -143,12 +152,81 @@ impl MountMgr {
 
                 // Convert OCI spec to syscall types
                 let source = mnt.source().as_deref();
-                let fstype = mnt.typ().as_deref();
+                let mut fstype = mnt.typ().as_deref();
 
-                mount(source, dest, fstype, flags, data).map_err(|e| KuroError::MountFailed {
-                    target: dest.to_string_lossy().to_string(),
-                    source: e,
-                })?;
+                // cgroup mount (special case)
+                if fstype == Some("cgroup") {
+                    if Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+                        || Path::new("/sys/fs/cgroup/").exists()
+                    {
+                        fstype = Some("cgroup2");
+                    }
+                }
+
+                // Check if bind mount
+                let is_bind = flags.contains(MsFlags::MS_BIND);
+
+                if is_bind {
+                    // Bind mount
+                    // Perform bind mount first
+                    let bind_flags = if flags.contains(MsFlags::MS_REC) {
+                        MsFlags::MS_BIND | MsFlags::MS_REC
+                    } else {
+                        MsFlags::MS_BIND
+                    };
+                    mount(source, dest, fstype, bind_flags, None::<&str>).map_err(|e| {
+                        KuroError::MountFailed {
+                            target: dest.to_string_lossy().to_string(),
+                            source: e,
+                        }
+                    })?;
+
+                    // Apply attribute flags
+                    let attr_flags = flags & !MsFlags::MS_REC;
+                    if !attr_flags.is_empty() && attr_flags != MsFlags::MS_BIND {
+                        let remount_flags = attr_flags | MsFlags::MS_REMOUNT | MsFlags::MS_BIND;
+                        mount(
+                            None::<&str>,
+                            dest,
+                            None::<&str>,
+                            remount_flags,
+                            None::<&str>,
+                        )
+                        .map_err(|e| KuroError::MountFailed {
+                            target: dest.to_string_lossy().to_string(),
+                            source: e,
+                        })?;
+                    }
+                } else {
+                    // Regular mount
+                    // mount(source, dest, fstype, flags, data).map_err(|e| {
+                    //     KuroError::MountFailed {
+                    //         target: dest.to_string_lossy().to_string(),
+                    //         source: e,
+                    //     }
+                    // })?;
+
+                    if let Err(e) = mount(source, dest, fstype, flags, data) {
+                        if fstype == Some("cgroup") || fstype == Some("cgroup2") {
+                            mount(
+                                Some("/sys/fs/cgroup/"),
+                                dest,
+                                None::<&str>,
+                                MsFlags::MS_BIND | MsFlags::MS_REC | flags,
+                                None::<&str>,
+                            )
+                            .map_err(|be| KuroError::MountFailed {
+                                target: dest.to_string_lossy().to_string(),
+                                source: be,
+                            })?;
+                        } else {
+                            return Err(KuroError::MountFailed {
+                                target: dest.to_string_lossy().to_string(),
+                                source: e,
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -176,6 +254,9 @@ impl MountMgr {
                 "private" => flags.insert(MsFlags::MS_PRIVATE),
                 "slave" => flags.insert(MsFlags::MS_SLAVE),
                 "shared" => flags.insert(MsFlags::MS_SHARED),
+                "strictatime" => flags.insert(MsFlags::MS_STRICTATIME),
+                "relatime" => flags.insert(MsFlags::MS_RELATIME),
+                "silent" => flags.insert(MsFlags::MS_SILENT),
                 other => data_opts.push(other),
             }
         }
@@ -186,9 +267,14 @@ impl MountMgr {
     }
 
     /// Set up readonly paths (RDONLY)
-    fn set_readonly(linux: &Linux) -> Result<()> {
+    pub fn set_readonly(linux: &Linux) -> Result<()> {
         if let Some(rdpaths) = linux.readonly_paths() {
             for path in rdpaths {
+                let ppath = Path::new(path);
+                if !ppath.exists() {
+                    continue;
+                }
+
                 // Mount as bind-mount
                 mount(
                     Some(path.as_str()),
@@ -220,7 +306,7 @@ impl MountMgr {
     }
 
     /// Set up masked paths
-    fn set_masked(linux: &Linux) -> Result<()> {
+    pub fn set_masked(linux: &Linux) -> Result<()> {
         if let Some(maskpaths) = linux.masked_paths() {
             for path in maskpaths {
                 let path = Path::new(path);

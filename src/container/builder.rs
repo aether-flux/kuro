@@ -308,6 +308,12 @@ impl<'a> CBuilder<'a> {
                 }
             }
 
+            // Apply masked and readonly paths
+            if let Some(linux) = self.spec.linux() {
+                MountMgr::set_masked(&linux)?;
+                MountMgr::set_readonly(&linux)?;
+            }
+
             // Handle interactive terminal (PTY)
             let interactive = self
                 .spec
