@@ -17,6 +17,7 @@ nix = { version = "0.31.3", features = [
   "hostname",
   "resource",
   "term",
+  "socket",
 ] }
 oci-spec = "0.10.0"
 serde = { version = "1.0.229", features = ["derive"] }

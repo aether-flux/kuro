@@ -67,6 +67,7 @@ src/
     security.rs
     userns.rs
   sync/
+    console.rs
     fifo.rs
     mod.rs
     pipe.rs
@@ -80,6 +81,88 @@ DOC.md
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="src/sync/console.rs">
+use std::{
+    fs,
+    io::{IoSlice, IoSliceMut},
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::net::{UnixListener, UnixStream},
+    },
+    path::Path,
+};
+
+use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
+
+use crate::error::{KuroError, Result};
+
+pub struct ConsoleSocket;
+
+impl ConsoleSocket {
+    /// Host: bind a fresh socket
+    pub fn listen(path: &Path) -> Result<UnixListener> {
+        let _ = fs::remove_file(&path);
+        UnixListener::bind(&path).map_err(|e| {
+            KuroError::ExecFailed(format!("Failed to bind console socket {:?}: {}", path, e))
+        })
+    }
+
+    /// Host: accept one connection only and receive master PTY fd
+    pub fn recv_fd(listener: &UnixListener) -> Result<RawFd> {
+        let (stream, _) = listener.accept().map_err(|e| {
+            KuroError::ExecFailed(format!("Failed to accept console connection: {}", e))
+        })?;
+        let raw_fd = stream.as_raw_fd();
+
+        let mut byte = [0u8; 1];
+        let mut iov = [IoSliceMut::new(&mut byte)];
+        let mut cmsg_buffer = nix::cmsg_space!([RawFd; 1]);
+
+        let msg = recvmsg::<()>(raw_fd, &mut iov, Some(&mut cmsg_buffer), MsgFlags::empty())
+            .map_err(|e| {
+                KuroError::ExecFailed(format!("recvmsg on console socket failed: {}", e))
+            })?;
+
+        for cmsg in msg
+            .cmsgs()
+            .map_err(|e| KuroError::ExecFailed(format!("Failed to read cmsgs: {}", e)))?
+        {
+            if let ControlMessageOwned::ScmRights(fds) = cmsg {
+                if let Some(fd) = fds.into_iter().next() {
+                    return Ok(fd);
+                }
+            }
+        }
+
+        Err(KuroError::ExecFailed(
+            "No fd received over console socket".to_string(),
+        ))
+    }
+
+    /// Child: connect to socket and send master fd
+    pub fn send_fd(path: &Path, fd: RawFd) -> Result<()> {
+        let stream = UnixStream::connect(path).map_err(|e| {
+            KuroError::ExecFailed(format!(
+                "Failed to connect to console socket {:?}: {}",
+                path, e
+            ))
+        })?;
+        let raw_fd = stream.as_raw_fd();
+
+        let byte = [b'c'];
+        let iov = [IoSlice::new(&byte)];
+        let fds = [fd];
+        let cmsgs = [ControlMessage::ScmRights(&fds)];
+
+        sendmsg::<()>(raw_fd, &iov, &cmsgs, MsgFlags::empty(), None).map_err(|e| {
+            KuroError::ExecFailed(format!("sendmsg on console socket failed: {}", e))
+        })?;
+
+        Ok(())
+    }
+}
+</file>
 
 <file path="src/cli/commands.rs">
 use clap::{Parser, Subcommand};
@@ -306,30 +389,41 @@ pub mod terminal;
 use std::{
     fs::{File, OpenOptions},
     os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+    path::Path,
 };
 
 use nix::{
     pty::{OpenptyResult, openpty},
-    unistd::{dup2, setsid},
+    unistd::{dup2, dup2_stderr, dup2_stdin, dup2_stdout, setsid},
 };
 
-use crate::error::{KuroError, Result};
+use crate::{
+    error::{KuroError, Result},
+    sync::console::ConsoleSocket,
+};
 
 pub struct TermMgr;
 
 impl TermMgr {
     /// Setup container IO depending on whether terminal is interactive (PTY) or not
-    pub fn setup_terminal(interactive: bool) -> Result<Option<File>> {
+    pub fn setup_terminal(interactive: bool, console_sock_path: &Path) -> Result<()> {
         if interactive {
             // Create PTY master/slave pair
             let OpenptyResult { master, slave } = openpty(None, None)
                 .map_err(|e| KuroError::ExecFailed(format!("Failed to openpty: {}", e)))?;
+
+            // Send master fd to host (kuro start)
+            println!("terminal: sending fd");
+            ConsoleSocket::send_fd(&console_sock_path, master.as_raw_fd())?;
+            println!("terminal: sent fd to {:?}", console_sock_path);
+            drop(master); // receiver keeps it alive
 
             setsid().map_err(|e| KuroError::ExecFailed(format!("Failed to setsid: {}", e)))?;
 
             unsafe {
                 // TIOSCSTTY sets slave fd as the controlling terminal for this proc
                 if libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0) < 0 {
+                    // if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
                     return Err(KuroError::ExecFailed(
                         "Failed to set controlling terminal (TIOCSCTTY)".to_string(),
                     ));
@@ -339,22 +433,38 @@ impl TermMgr {
             // Duplicate slave to stdin(fd0) stdout(fd1) stderr(fd2)
             unsafe {
                 let slave_fd = slave.as_fd();
-                dup2(slave_fd, &mut OwnedFd::from_raw_fd(0.as_raw_fd()))
+                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(0.as_raw_fd()))
+                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdin failed: {}", e)))?;
+                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(1.as_raw_fd()))
+                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdout failed: {}", e)))?;
+                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(2.as_raw_fd()))
+                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stderr failed: {}", e)))?;
+                dup2_stdin(slave_fd)
                     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdin failed: {}", e)))?;
-                dup2(slave_fd, &mut OwnedFd::from_raw_fd(1.as_raw_fd()))
+                dup2_stdout(slave_fd)
                     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdout failed: {}", e)))?;
-                dup2(slave_fd, &mut OwnedFd::from_raw_fd(2.as_raw_fd()))
+                dup2_stderr(slave_fd)
                     .map_err(|e| KuroError::ExecFailed(format!("dup2 stderr failed: {}", e)))?;
+                // for fd in 0..=2 {
+                //     if libc::dup2(slave_fd, fd) < 0 {
+                //         return Err(KuroError::ExecFailed(format!(
+                //             "dup2 to fd {} failed: {}",
+                //             fd,
+                //             std::io::Error::last_os_error()
+                //         )));
+                //     }
+                // }
             }
 
             // Return master fd so host can relay it to CLI IO
-            let master_file = unsafe { File::from_raw_fd(master.into_raw_fd()) };
-            Ok(Some(master_file))
+            // let master_file = unsafe { File::from_raw_fd(master.into_raw_fd()) };
+            // Ok(Some(master_file))
         } else {
             // Non-interactive; ensure standard stream descriptors are valid
             Self::ensure_std_descriptors()?;
-            Ok(None)
+            // Ok(None)
         }
+        Ok(())
     }
 
     fn ensure_std_descriptors() -> Result<()> {
@@ -367,11 +477,18 @@ impl TermMgr {
                     .map_err(|e| {
                         KuroError::ExecFailed(format!("Failed to open /dev/null: {}", e))
                     })?;
-                unsafe {
-                    dup2(dev_null.as_fd(), &mut OwnedFd::from_raw_fd(fd.as_raw_fd())).map_err(
-                        |e| KuroError::ExecFailed(format!("dup2 to /dev/null failed: {}", e)),
-                    )?;
+                // unsafe {
+                //     dup2(dev_null.as_fd(), &mut OwnedFd::from_raw_fd(fd.as_raw_fd())).map_err(
+                //         |e| KuroError::ExecFailed(format!("dup2 to /dev/null failed: {}", e)),
+                //     )?;
+                // }
+
+                match fd {
+                    0 => dup2_stdin(dev_null.as_fd()),
+                    1 => dup2_stdout(dev_null.as_fd()),
+                    _ => dup2_stderr(dev_null.as_fd()),
                 }
+                .map_err(|e| KuroError::ExecFailed(format!("dup2 to /dev/null failed: {}", e)))?;
             }
         }
 
@@ -777,83 +894,6 @@ impl UserMgr {
                 )));
             }
         }
-
-        Ok(())
-    }
-}
-</file>
-
-<file path="src/sync/fifo.rs">
-use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
-};
-
-use libc::O_NONBLOCK;
-use nix::{sys::stat::Mode, unistd::mkfifo};
-
-use crate::error::{KuroError, Result};
-
-pub struct ExecFifo;
-
-impl ExecFifo {
-    /// Create FIFO path
-    pub fn create_path(container_dir: &Path) -> PathBuf {
-        container_dir.join("exec.fifo")
-    }
-
-    /// Create FIFO pipe
-    pub fn init(container_dir: &Path) -> Result<PathBuf> {
-        let path = Self::create_path(&container_dir);
-        if path.exists() {
-            let _ = fs::remove_file(&path);
-        }
-
-        mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR)
-            .map_err(|e| KuroError::SyncPipe(format!("Failed to create '{:?}': {}", &path, e)))?;
-        Ok(path)
-    }
-
-    /// Open file while host /run is available
-    pub fn open_for_read(fifo_path: &Path) -> Result<File> {
-        // File::open(&fifo_path)
-        //     .map_err(|e| KuroError::SyncPipe(format!("Failed to open '{:?}': {}", &fifo_path, e)))
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(fifo_path)
-            .map_err(|e| KuroError::SyncPipe(format!("Failed to open '{:?}': {}", &fifo_path, e)))
-    }
-
-    /// Wait on already-opened file descriptor
-    pub fn wait_for_start(fifo_file: File) -> Result<()> {
-        // Clear O_NONBLOCK so read_exact() can now block
-        // use std::os::unix::io::AsRawFd;
-        // let fd = fifo_file.as_raw_fd();
-        // unsafe {
-        //     let flags = libc::fcntl(fd, libc::F_GETFL);
-        //     libc::fcntl(fd, libc::F_SETFL, flags & !O_NONBLOCK);
-        // }
-
-        let mut fifo_file = fifo_file;
-        let mut buf = [0u8; 1];
-        fifo_file
-            .read_exact(&mut buf)
-            .map_err(|e| KuroError::SyncPipe(format!("Failed to read signal: {}", e)))?;
-        Ok(())
-    }
-
-    /// Send signal to child to unblock
-    pub fn signal_start(container_dir: &Path) -> Result<()> {
-        let path = Self::create_path(&container_dir);
-        let mut fifo = OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .map_err(|e| KuroError::SyncPipe(format!("Failed to create '{:?}': {}", &path, e)))?;
-        fifo.write_all(&[1u8])
-            .map_err(|e| KuroError::SyncPipe(format!("Failed to send signal: {}", e)))?;
 
         Ok(())
     }
@@ -1323,108 +1363,87 @@ impl SecMgr {
 }
 </file>
 
-<file path="src/sync/mod.rs">
-pub mod fifo;
-pub mod pipe;
+<file path="src/sync/fifo.rs">
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+};
+
+use libc::O_NONBLOCK;
+use nix::{sys::stat::Mode, unistd::mkfifo};
+
+use crate::error::{KuroError, Result};
+
+pub struct ExecFifo;
+
+impl ExecFifo {
+    /// Create FIFO path
+    pub fn create_path(container_dir: &Path) -> PathBuf {
+        container_dir.join("exec.fifo")
+    }
+
+    /// Create FIFO pipe
+    pub fn init(container_dir: &Path) -> Result<PathBuf> {
+        let path = Self::create_path(&container_dir);
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+
+        mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to create '{:?}': {}", &path, e)))?;
+        Ok(path)
+    }
+
+    /// Open file while host /run is available
+    pub fn open_for_read(fifo_path: &Path) -> Result<File> {
+        // File::open(&fifo_path)
+        //     .map_err(|e| KuroError::SyncPipe(format!("Failed to open '{:?}': {}", &fifo_path, e)))
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(fifo_path)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to open '{:?}': {}", &fifo_path, e)))
+    }
+
+    /// Wait on already-opened file descriptor
+    pub fn wait_for_start(fifo_file: File) -> Result<()> {
+        // Clear O_NONBLOCK so read_exact() can now block
+        // use std::os::unix::io::AsRawFd;
+        // let fd = fifo_file.as_raw_fd();
+        // unsafe {
+        //     let flags = libc::fcntl(fd, libc::F_GETFL);
+        //     libc::fcntl(fd, libc::F_SETFL, flags & !O_NONBLOCK);
+        // }
+
+        let mut fifo_file = fifo_file;
+        let mut buf = [0u8; 1];
+        fifo_file
+            .read_exact(&mut buf)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to read signal: {}", e)))?;
+        Ok(())
+    }
+
+    /// Send signal to child to unblock
+    pub fn signal_start(container_dir: &Path) -> Result<()> {
+        let path = Self::create_path(&container_dir);
+        let mut fifo = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to create '{:?}': {}", &path, e)))?;
+        fifo.write_all(&[1u8])
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to send signal: {}", e)))?;
+
+        Ok(())
+    }
+}
 </file>
 
-<file path="BUGS.md">
-# Initial Run (Sep 16, 2026)
-
-## Run 1
-
-### Test Environment
-- Rootfs: local `./alpinefs/`
-- Command: `kuro create alp-test ./alpinefs`
-
-### Logs
-```sh
-[kuro-host] Spawned container init process with PID: 6553
-[kuro] Error during initialization: Mount failed for target '/dev': EINVAL: Invalid argument
-```
-
-## Run 2
-
-### Test Environment
-- Rootfs: `./alpinefs/`
-- Command: `kuro state alp-test`
-
-### Logs
-```sh
-{
-  "ociVersion": "1.3.0",
-  "id": "alp-test",
-  "status": "created",
-  "pid": -1,
-  "bundle": "/home/aether/Projects/kuro/alpinefs",
-  "annotations": {}
-}
-```
-
-## Run 4
-
-### Test Env
-- Rootfs: ./alpinefs/
-- Command: kuro create alp-test ./alpinefs
-
-### Logs
-```sh
-[kuro-host] Spawned container init process with PID: 9968
-[kuro] Error during initialization: Mount failed for target '/sys/fs/cgroup': EPERM: Operation not permitted
-[kuro] Command execution failed: Child initialization failed: Mount failed for target '/sys/fs/cgroup': EPERM: Operation not permitted
-[kuro] Cleaning up container 'alp-test'...
-[kuro] WARN: Failed to remove cgroup path "/sys/fs/cgroup/kuro/alp-test": Device or resource busy (os error 16)
-Error: ExecFailed("Child initialization failed: Mount failed for target '/sys/fs/cgroup': EPERM: Operation not permitted")
-```
-
-## Run 5
-
-### Test Env
-- Rootfs: ./alpinefs/
-- Command: kuro create alp-test ./alpinefs
-
-### Logs
-```sh
-[kuro-host] Spawned container init process with PID: 11995
-[kuro] Error during initialization: Mount failed for target '/dev/mqueue': EBUSY: Device or resource busy
-[kuro] Command execution failed: Child initialization failed: Mount failed for target '/dev/mqueue': EBUSY: Device or resource busy
-[kuro] Cleaning up container 'alp-test'...
-[kuro] WARN: Failed to remove cgroup path "/sys/fs/cgroup/kuro/alp-test": Device or resource busy (os error 16)
-Error: ExecFailed("Child initialization failed: Mount failed for target '/dev/mqueue': EBUSY: Device or resource busy")
-```
-
-## Run 6
-
-### Test env
-- Rootfs: ./alpinefs
-- Command: kuro start alp-test
-
-### Logs
-```sh
-state loaded
-spec loaded
-signal sent
-status saved
-Started container alp-test...
-```
-
-#### Insights
-- Start command logs properly and starts container, but command (here, 'sh') doesn't appear on terminal (probably issue with attaching stdin/stdout/stder). Status = stopped (was 'created' before this).
-
-
-# Fixed Bugs
-- Cleanup kills every single process
-- EPERM mount, invalid "/old_root" (replaced "." with &root)
-- Container state being "created" even though it wasn't
-- Child hangs on setup error because parent keeps listening for signal that'll never arrive
-- Mount error, not able to mount /dev device with EINVAL
-- Mount error, /sys/fs/cgroup/ EPERM Operation Not Permitted
-- Mount error, /dev/mqueue/ EBUSY Device or resource busy
-- Mount error, /dev/null no such file or directory (during masked path /proc/kcore)
-- Start command does not do anything
-  - Looks like container process dies after create command finishes.
-  - But that's pure coincidence of timing. Actual issue is related to the named pipe (fifo).
-  - It opens the file as read-only, and at that moment the writer count on it is 0. When later called a read(), rule is if there are currently 0 writers open, read() returns 0 (EOF) immediately. Clearing NONBLOCK doesn't matter.
+<file path="src/sync/mod.rs">
+pub mod console;
+pub mod fifo;
+pub mod pipe;
 </file>
 
 <file path="Cargo.toml">
@@ -1447,6 +1466,7 @@ nix = { version = "0.31.3", features = [
   "hostname",
   "resource",
   "term",
+  "socket",
 ] }
 oci-spec = "0.10.0"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -1839,6 +1859,104 @@ fn main() -> Result<()> {
 /alpinefs
 </file>
 
+<file path="BUGS.md">
+## Run 1
+
+### Test Environment
+- Rootfs: local `./alpinefs/`
+- Command: `kuro create alp-test ./alpinefs`
+
+### Logs
+```sh
+[kuro-host] Spawned container init process with PID: 6553
+[kuro] Error during initialization: Mount failed for target '/dev': EINVAL: Invalid argument
+```
+
+## Run 2
+
+### Test Environment
+- Rootfs: `./alpinefs/`
+- Command: `kuro state alp-test`
+
+### Logs
+```sh
+{
+  "ociVersion": "1.3.0",
+  "id": "alp-test",
+  "status": "created",
+  "pid": -1,
+  "bundle": "/home/aether/Projects/kuro/alpinefs",
+  "annotations": {}
+}
+```
+
+## Run 4
+
+### Test Env
+- Rootfs: ./alpinefs/
+- Command: kuro create alp-test ./alpinefs
+
+### Logs
+```sh
+[kuro-host] Spawned container init process with PID: 9968
+[kuro] Error during initialization: Mount failed for target '/sys/fs/cgroup': EPERM: Operation not permitted
+[kuro] Command execution failed: Child initialization failed: Mount failed for target '/sys/fs/cgroup': EPERM: Operation not permitted
+[kuro] Cleaning up container 'alp-test'...
+[kuro] WARN: Failed to remove cgroup path "/sys/fs/cgroup/kuro/alp-test": Device or resource busy (os error 16)
+Error: ExecFailed("Child initialization failed: Mount failed for target '/sys/fs/cgroup': EPERM: Operation not permitted")
+```
+
+## Run 5
+
+### Test Env
+- Rootfs: ./alpinefs/
+- Command: kuro create alp-test ./alpinefs
+
+### Logs
+```sh
+[kuro-host] Spawned container init process with PID: 11995
+[kuro] Error during initialization: Mount failed for target '/dev/mqueue': EBUSY: Device or resource busy
+[kuro] Command execution failed: Child initialization failed: Mount failed for target '/dev/mqueue': EBUSY: Device or resource busy
+[kuro] Cleaning up container 'alp-test'...
+[kuro] WARN: Failed to remove cgroup path "/sys/fs/cgroup/kuro/alp-test": Device or resource busy (os error 16)
+Error: ExecFailed("Child initialization failed: Mount failed for target '/dev/mqueue': EBUSY: Device or resource busy")
+```
+
+## Run 6
+
+### Test env
+- Rootfs: ./alpinefs
+- Command: kuro start alp-test
+
+### Logs
+```sh
+state loaded
+spec loaded
+signal sent
+status saved
+Started container alp-test...
+```
+
+#### Insights
+- Start command logs properly and starts container, but command (here, 'sh') doesn't appear on terminal (probably issue with attaching stdin/stdout/stder). Status = stopped (was 'created' before this).
+
+
+# Fixed Bugs
+- Cleanup kills every single process
+- EPERM mount, invalid "/old_root" (replaced "." with &root)
+- Container state being "created" even though it wasn't
+- Child hangs on setup error because parent keeps listening for signal that'll never arrive
+- Mount error, not able to mount /dev device with EINVAL
+- Mount error, /sys/fs/cgroup/ EPERM Operation Not Permitted
+- Mount error, /dev/mqueue/ EBUSY Device or resource busy
+- Mount error, /dev/null no such file or directory (during masked path /proc/kcore)
+- Start command does not do anything
+  - Looks like container process dies after create command finishes.
+  - But that's pure coincidence of timing. Actual issue is related to the named pipe (fifo).
+  - It opens the file as read-only, and at that moment the writer count on it is 0. When later called a read(), rule is if there are currently 0 writers open, read() returns 0 (EOF) immediately. Clearing NONBLOCK doesn't matter.
+- Fixing terminal with libc::dup2() results in create command hanging after opening pipe.
+</file>
+
 <file path="src/namespaces/mod.rs">
 pub mod mount;
 pub mod netns;
@@ -1847,10 +1965,20 @@ pub mod userns;
 </file>
 
 <file path="src/cli/handle.rs">
-use std::{collections::HashMap, path::PathBuf, str::FromStr};
+use std::{
+    collections::HashMap,
+    fs,
+    io::{Read, Write},
+    os::fd::FromRawFd,
+    path::PathBuf,
+    str::FromStr,
+};
 
 use nix::{
-    sys::signal::{Signal, kill},
+    sys::{
+        signal::{Signal, kill},
+        termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr},
+    },
     unistd::Pid,
 };
 
@@ -1863,7 +1991,7 @@ use crate::{
         state::{ContainerState, ContainerStatus},
     },
     error::{KuroError, Result, validate_id},
-    sync::{fifo::ExecFifo, pipe::SyncPipe},
+    sync::{console::ConsoleSocket, fifo::ExecFifo, pipe::SyncPipe},
 };
 
 pub fn handle_commands(args: &CliArgs) -> Result<()> {
@@ -1955,22 +2083,36 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
             if state.status != ContainerStatus::Created {
                 return Err(KuroError::Start(format!(
                     "Container '{}' is in {:?} state, expected Created",
-                    &container_id, state.status
+                    container_id, state.status
                 )));
             }
             if state.pid < 2 {
                 return Err(KuroError::Start(format!(
                     "Container '{}' has not been created properly, and has no PID (check by running 'kuro state')",
-                    &container_id
+                    container_id
                 )));
             }
             println!("state loaded");
 
             let spec = load_spec(&PathBuf::from(&state.bundle))?;
-            println!("spec loaded");
+            let interactive = spec
+                .process()
+                .as_ref()
+                .and_then(|p| p.terminal())
+                .unwrap_or(false);
+            println!("spec loaded, interactive = {}", interactive);
+
+            let state_dir = ContainerState::get_state_dir(&container_id);
+            let socket_path = state_dir.join("console.sock");
+
+            let console_listener = if interactive {
+                Some(ConsoleSocket::listen(&socket_path)?)
+            } else {
+                None
+            };
+            println!("console listener: {:?}", console_listener);
 
             // Signal PID 1 to start container
-            let state_dir = ContainerState::get_state_dir(&container_id);
             ExecFifo::signal_start(&state_dir)?;
             println!("signal sent");
 
@@ -1983,6 +2125,62 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
             CBuilder::run_hook(&spec, &container_id, "poststart")?;
 
             println!("Started container {}...", container_id);
+
+            if let Some(listener) = console_listener {
+                let master_fd = ConsoleSocket::recv_fd(&listener)?;
+                println!("received fd");
+                let _ = fs::remove_file(&socket_path);
+
+                let master_file = unsafe { fs::File::from_raw_fd(master_fd) };
+                let mut master_writer = master_file.try_clone().map_err(|e| {
+                    KuroError::ExecFailed(format!("Failed to clone console fd: {}", e))
+                })?;
+                let mut master_reader = master_file;
+
+                // Send keystrokes to container's shell
+                let stdin_handle = std::io::stdin();
+                let orig_termios = tcgetattr(&stdin_handle)
+                    .map_err(|e| KuroError::ExecFailed(format!("tcgetattr failed: {}", e)))?;
+                let mut raw = orig_termios.clone();
+                cfmakeraw(&mut raw);
+                tcsetattr(&stdin_handle, SetArg::TCSANOW, &raw)
+                    .map_err(|e| KuroError::ExecFailed(format!("tcsetattr failed: {}", e)))?;
+
+                // stdin -> container
+                std::thread::spawn(move || {
+                    let mut stdin = std::io::stdin();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stdin.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if master_writer.write_all(&buf[..n]).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+
+                // container -> stdout
+                let mut stdout = std::io::stdout();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match master_reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let _ = stdout.write_all(&buf[..n]);
+                            let _ = stdout.flush();
+                        }
+                    }
+                }
+
+                let _ = tcsetattr(&stdin_handle, SetArg::TCSANOW, &orig_termios);
+                println!("\n[kuro] Container {} exited", container_id);
+
+                state.status = ContainerStatus::Stopped;
+                let _ = state.save();
+            }
         }
 
         // // State
@@ -2510,15 +2708,6 @@ impl<'a> CBuilder<'a> {
                 MountMgr::set_readonly(&linux)?;
             }
 
-            // Handle interactive terminal (PTY)
-            let interactive = self
-                .spec
-                .process()
-                .as_ref()
-                .and_then(|p| p.terminal())
-                .unwrap_or(false);
-            let _master_fd = TermMgr::setup_terminal(interactive)?;
-
             Ok(())
         })();
         println!("setup fn called");
@@ -2571,6 +2760,18 @@ impl<'a> CBuilder<'a> {
         // Unblocked -> Call start method
         println!("unblocked child");
         Self::run_hook(&self.spec, &self.container_id, "startContainer")?;
+
+        // Handle interactive terminal (PTY)
+        let interactive = self
+            .spec
+            .process()
+            .as_ref()
+            .and_then(|p| p.terminal())
+            .unwrap_or(false);
+        let console_socket_path =
+            ContainerState::get_state_dir(&self.container_id).join("console.sock");
+        TermMgr::setup_terminal(interactive, &console_socket_path)?;
+
         Self::start(&self.spec)?;
 
         Ok(())

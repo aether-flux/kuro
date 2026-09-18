@@ -9,7 +9,10 @@ use nix::{
 };
 use oci_spec::runtime::{Linux, Spec};
 
-use crate::error::{KuroError, Result};
+use crate::{
+    container::state::ContainerState,
+    error::{KuroError, Result},
+};
 
 // [x]   Masked and readonly paths
 
@@ -78,6 +81,24 @@ impl MountMgr {
             target: "overlay".to_string(),
             source: e,
         })?;
+
+        // Bind-mount the container's state directory
+        let state_dir = ContainerState::get_state_dir(container_id);
+        if state_dir.exists() {
+            let target = merged.join(state_dir.strip_prefix("/").unwrap_or(&state_dir));
+            fs::create_dir_all(&target)?;
+            mount(
+                Some(&state_dir),
+                &target,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .map_err(|e| KuroError::MountFailed {
+                target: target.to_string_lossy().to_string(),
+                source: e,
+            })?;
+        }
 
         // pivot_root into isolated mount space
         Self::setup_pivot_root(&merged)?;

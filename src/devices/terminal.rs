@@ -1,30 +1,50 @@
 use std::{
     fs::{File, OpenOptions},
-    os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+    os::{
+        fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+        unix::net::UnixStream,
+    },
+    path::Path,
 };
 
 use nix::{
     pty::{OpenptyResult, openpty},
-    unistd::{dup2, setsid},
+    unistd::{dup2, dup2_stderr, dup2_stdin, dup2_stdout, setsid},
 };
 
-use crate::error::{KuroError, Result};
+use crate::{
+    error::{KuroError, Result},
+    sync::console::ConsoleSocket,
+};
 
 pub struct TermMgr;
 
 impl TermMgr {
     /// Setup container IO depending on whether terminal is interactive (PTY) or not
-    pub fn setup_terminal(interactive: bool) -> Result<Option<File>> {
+    pub fn setup_terminal(interactive: bool, console_steeam: &Option<UnixStream>) -> Result<()> {
+        if console_steeam.is_none() {
+            return Err(KuroError::SyncPipe(
+                "Console socket not connected".to_string(),
+            ));
+        }
+
         if interactive {
             // Create PTY master/slave pair
             let OpenptyResult { master, slave } = openpty(None, None)
                 .map_err(|e| KuroError::ExecFailed(format!("Failed to openpty: {}", e)))?;
+
+            // Send master fd to host (kuro start)
+            println!("terminal: sending fd");
+            ConsoleSocket::send_fd(console_steeam.as_ref().unwrap(), master.as_raw_fd())?;
+            println!("terminal: sent fd to socket");
+            drop(master); // receiver keeps it alive
 
             setsid().map_err(|e| KuroError::ExecFailed(format!("Failed to setsid: {}", e)))?;
 
             unsafe {
                 // TIOSCSTTY sets slave fd as the controlling terminal for this proc
                 if libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0) < 0 {
+                    // if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
                     return Err(KuroError::ExecFailed(
                         "Failed to set controlling terminal (TIOCSCTTY)".to_string(),
                     ));
@@ -34,22 +54,38 @@ impl TermMgr {
             // Duplicate slave to stdin(fd0) stdout(fd1) stderr(fd2)
             unsafe {
                 let slave_fd = slave.as_fd();
-                dup2(slave_fd, &mut OwnedFd::from_raw_fd(0.as_raw_fd()))
+                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(0.as_raw_fd()))
+                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdin failed: {}", e)))?;
+                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(1.as_raw_fd()))
+                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdout failed: {}", e)))?;
+                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(2.as_raw_fd()))
+                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stderr failed: {}", e)))?;
+                dup2_stdin(slave_fd)
                     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdin failed: {}", e)))?;
-                dup2(slave_fd, &mut OwnedFd::from_raw_fd(1.as_raw_fd()))
+                dup2_stdout(slave_fd)
                     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdout failed: {}", e)))?;
-                dup2(slave_fd, &mut OwnedFd::from_raw_fd(2.as_raw_fd()))
+                dup2_stderr(slave_fd)
                     .map_err(|e| KuroError::ExecFailed(format!("dup2 stderr failed: {}", e)))?;
+                // for fd in 0..=2 {
+                //     if libc::dup2(slave_fd, fd) < 0 {
+                //         return Err(KuroError::ExecFailed(format!(
+                //             "dup2 to fd {} failed: {}",
+                //             fd,
+                //             std::io::Error::last_os_error()
+                //         )));
+                //     }
+                // }
             }
 
             // Return master fd so host can relay it to CLI IO
-            let master_file = unsafe { File::from_raw_fd(master.into_raw_fd()) };
-            Ok(Some(master_file))
+            // let master_file = unsafe { File::from_raw_fd(master.into_raw_fd()) };
+            // Ok(Some(master_file))
         } else {
             // Non-interactive; ensure standard stream descriptors are valid
             Self::ensure_std_descriptors()?;
-            Ok(None)
+            // Ok(None)
         }
+        Ok(())
     }
 
     fn ensure_std_descriptors() -> Result<()> {
@@ -62,11 +98,18 @@ impl TermMgr {
                     .map_err(|e| {
                         KuroError::ExecFailed(format!("Failed to open /dev/null: {}", e))
                     })?;
-                unsafe {
-                    dup2(dev_null.as_fd(), &mut OwnedFd::from_raw_fd(fd.as_raw_fd())).map_err(
-                        |e| KuroError::ExecFailed(format!("dup2 to /dev/null failed: {}", e)),
-                    )?;
+                // unsafe {
+                //     dup2(dev_null.as_fd(), &mut OwnedFd::from_raw_fd(fd.as_raw_fd())).map_err(
+                //         |e| KuroError::ExecFailed(format!("dup2 to /dev/null failed: {}", e)),
+                //     )?;
+                // }
+
+                match fd {
+                    0 => dup2_stdin(dev_null.as_fd()),
+                    1 => dup2_stdout(dev_null.as_fd()),
+                    _ => dup2_stderr(dev_null.as_fd()),
                 }
+                .map_err(|e| KuroError::ExecFailed(format!("dup2 to /dev/null failed: {}", e)))?;
             }
         }
 

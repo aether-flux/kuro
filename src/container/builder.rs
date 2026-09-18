@@ -3,9 +3,8 @@ use std::{
     fs::File,
     io::Write,
     os::fd::AsFd,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Stdio},
-    time::Duration,
 };
 
 use crate::{
@@ -15,6 +14,7 @@ use crate::{
     error::{KuroError, Result},
     namespaces::{mount::MountMgr, netns::NetMgr, security::SecMgr, userns::UserMgr},
     sync::{
+        console::ConsoleSocket,
         fifo::ExecFifo,
         pipe::{SyncPipe, SyncResult},
     },
@@ -61,7 +61,7 @@ impl<'a> CBuilder<'a> {
             };
 
             if let Some(list) = hook_list {
-                let state = ContainerState::load(&container_id)?;
+                let state = ContainerState::load(container_id)?;
                 let state_json = serde_json::to_string(&state).map_err(|e| {
                     KuroError::Hook(format!("Failed to serialize container state: {}", e))
                 })?;
@@ -179,8 +179,8 @@ impl<'a> CBuilder<'a> {
         println!("state updated from host");
 
         // Child setup completed; can run hooks now
-        Self::run_hook(&self.spec, &self.container_id, "prestart")?;
-        Self::run_hook(&self.spec, &self.container_id, "createRuntime")?;
+        Self::run_hook(self.spec, &self.container_id, "prestart")?;
+        Self::run_hook(self.spec, &self.container_id, "createRuntime")?;
 
         // Signal child that parent has run hooks
         parent_to_child.send_ready()?;
@@ -246,7 +246,7 @@ impl<'a> CBuilder<'a> {
         SecMgr::setup_security(&spec)?;
         if let Some(linux) = spec.linux() {
             if let Some(seccomp) = linux.seccomp() {
-                SecMgr::apply_seccomp(&seccomp)?;
+                SecMgr::apply_seccomp(seccomp)?;
             }
         }
 
@@ -319,18 +319,9 @@ impl<'a> CBuilder<'a> {
 
             // Apply masked and readonly paths
             if let Some(linux) = self.spec.linux() {
-                MountMgr::set_masked(&linux)?;
-                MountMgr::set_readonly(&linux)?;
+                MountMgr::set_masked(linux)?;
+                MountMgr::set_readonly(linux)?;
             }
-
-            // Handle interactive terminal (PTY)
-            let interactive = self
-                .spec
-                .process()
-                .as_ref()
-                .and_then(|p| p.terminal())
-                .unwrap_or(false);
-            let _master_fd = TermMgr::setup_terminal(interactive)?;
 
             Ok(())
         })();
@@ -369,7 +360,7 @@ impl<'a> CBuilder<'a> {
         }
 
         // Parent has run hooks, now child will run hook
-        if let Err(e) = Self::run_hook(&self.spec, &self.container_id, "createContainer") {
+        if let Err(e) = Self::run_hook(self.spec, &self.container_id, "createContainer") {
             let _ = child_to_parent.send_err(&e.to_string());
             return Err(e);
         }
@@ -383,8 +374,27 @@ impl<'a> CBuilder<'a> {
 
         // Unblocked -> Call start method
         println!("unblocked child");
-        Self::run_hook(&self.spec, &self.container_id, "startContainer")?;
-        Self::start(&self.spec)?;
+        Self::run_hook(self.spec, &self.container_id, "startContainer")?;
+
+        // Connect to console socket
+        let console_socket_path =
+            ContainerState::get_state_dir(&self.container_id).join("console.sock");
+        let interactive = self
+            .spec
+            .process()
+            .as_ref()
+            .and_then(|p| p.terminal())
+            .unwrap_or(false);
+        let console_stream = if interactive {
+            Some(ConsoleSocket::connect(&console_socket_path)?)
+        } else {
+            None
+        };
+
+        // Handle interactive terminal (PTY)
+        TermMgr::setup_terminal(interactive, &console_stream)?;
+
+        Self::start(self.spec)?;
 
         Ok(())
     }
@@ -398,23 +408,21 @@ impl<'a> CBuilder<'a> {
 
         if let Some(path) = path {
             // Path provided; attach existing namespace
-            let fd = File::open(&path).map_err(|e| {
+            let fd = File::open(path).map_err(|e| {
                 KuroError::Namespace(format!("Failed to open namespace path: {}", e))
             })?;
             if let Some(flag) = Self::get_clone_flag(typ) {
                 setns(fd.as_fd(), flag).map_err(|e| {
                     KuroError::Namespace(format!(
                         "Failed to set namespace '{}' to path '{:?}': {}",
-                        typ.to_string(),
-                        path,
-                        e
+                        typ, path, e
                     ))
                 })?;
             } else {
                 // Unsupported flags / namespace types (time)
                 return Err(KuroError::Namespace(format!(
                     "Unsupported namespace type: {}",
-                    typ.to_string()
+                    typ,
                 )));
             }
         } else {
@@ -448,7 +456,7 @@ impl<'a> CBuilder<'a> {
             | LinuxNamespaceType::Pid
             | LinuxNamespaceType::Uts
             | LinuxNamespaceType::Ipc
-            | LinuxNamespaceType::Cgroup => return Ok(()),
+            | LinuxNamespaceType::Cgroup => Ok(()),
             _ => Err(KuroError::Namespace(
                 "Unsupported namespace type".to_string(),
             )),
