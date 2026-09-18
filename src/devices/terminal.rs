@@ -51,30 +51,32 @@ impl TermMgr {
             }
 
             // Duplicate slave to stdin(fd0) stdout(fd1) stderr(fd2)
-            unsafe {
-                let slave_fd = slave.as_fd();
-                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(0.as_raw_fd()))
-                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdin failed: {}", e)))?;
-                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(1.as_raw_fd()))
-                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdout failed: {}", e)))?;
-                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(2.as_raw_fd()))
-                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stderr failed: {}", e)))?;
-                dup2_stdin(slave_fd)
-                    .map_err(|e| KuroError::ExecFailed(format!("dup2 stdin failed: {}", e)))?;
-                dup2_stdout(slave_fd)
-                    .map_err(|e| KuroError::ExecFailed(format!("dup2 stdout failed: {}", e)))?;
-                dup2_stderr(slave_fd)
-                    .map_err(|e| KuroError::ExecFailed(format!("dup2 stderr failed: {}", e)))?;
-                // for fd in 0..=2 {
-                //     if libc::dup2(slave_fd, fd) < 0 {
-                //         return Err(KuroError::ExecFailed(format!(
-                //             "dup2 to fd {} failed: {}",
-                //             fd,
-                //             std::io::Error::last_os_error()
-                //         )));
-                //     }
-                // }
-            }
+            // unsafe {
+            // let slave_fd = slave.as_fd();
+            // dup2(slave_fd, &mut OwnedFd::from_raw_fd(0.as_raw_fd()))
+            //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdin failed: {}", e)))?;
+            // dup2(slave_fd, &mut OwnedFd::from_raw_fd(1.as_raw_fd()))
+            //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdout failed: {}", e)))?;
+            // dup2(slave_fd, &mut OwnedFd::from_raw_fd(2.as_raw_fd()))
+            //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stderr failed: {}", e)))?;
+            dup2_stdin(&slave)
+                .map_err(|e| KuroError::ExecFailed(format!("dup2 stdin failed: {}", e)))?;
+            dup2_stdout(&slave)
+                .map_err(|e| KuroError::ExecFailed(format!("dup2 stdout failed: {}", e)))?;
+            dup2_stderr(&slave)
+                .map_err(|e| KuroError::ExecFailed(format!("dup2 stderr failed: {}", e)))?;
+            // for fd in 0..=2 {
+            //     if libc::dup2(slave_fd, fd) < 0 {
+            //         return Err(KuroError::ExecFailed(format!(
+            //             "dup2 to fd {} failed: {}",
+            //             fd,
+            //             std::io::Error::last_os_error()
+            //         )));
+            //     }
+            // }
+            // }
+
+            drop(slave);
 
             // Return master fd so host can relay it to CLI IO
             // let master_file = unsafe { File::from_raw_fd(master.into_raw_fd()) };

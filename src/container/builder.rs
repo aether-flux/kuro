@@ -1,6 +1,6 @@
 use std::{
     ffi::CString,
-    fs::File,
+    fs::{self, File},
     io::Write,
     os::fd::AsFd,
     path::PathBuf,
@@ -22,7 +22,7 @@ use crate::{
 use nix::{
     sched::{CloneFlags, clone, setns},
     sys::signal::Signal,
-    unistd::{Pid, execve, sethostname},
+    unistd::{Pid, dup2_stderr, dup2_stdin, dup2_stdout, execve, sethostname},
 };
 use oci_spec::runtime::{Hook, LinuxNamespaceType, Spec};
 
@@ -90,11 +90,14 @@ impl<'a> CBuilder<'a> {
 
         // Closure executed in child process
         let child_fn = Box::new(|| -> isize {
-            match self.run_child_init(&child_to_parent, &parent_to_child) {
-                Ok(_) => 0,
-                Err(e) => {
-                    eprintln!("[kuro] Error during initialization: {}", e);
-                    std::process::exit(1);
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.run_child_init(&child_to_parent, &parent_to_child)
+            }));
+            match r {
+                Ok(Ok(_)) => 0,
+                _ => {
+                    println!("panicked: {:?}", r);
+                    unsafe { libc::exit(1) }
                 }
             }
         });
@@ -243,7 +246,7 @@ impl<'a> CBuilder<'a> {
             .collect::<Result<Vec<_>>>()?;
 
         // Drop privileges finally
-        // SecMgr::setup_security(&spec)?;
+        SecMgr::setup_security(spec)?;
         // if let Some(linux) = spec.linux() {
         //     if let Some(seccomp) = linux.seccomp() {
         //         SecMgr::apply_seccomp(seccomp)?;
@@ -368,6 +371,18 @@ impl<'a> CBuilder<'a> {
         // Signal parent that child is ready and paused
         child_to_parent.send_ready()?;
 
+        // Detach child stdio
+        let devnull = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")?;
+        dup2_stdin(&devnull)
+            .map_err(|e| KuroError::ExecFailed(format!("Failed dup2 stdin (child): {}", e)))?;
+        dup2_stdout(&devnull)
+            .map_err(|e| KuroError::ExecFailed(format!("Failed dup2 stdout (child): {}", e)))?;
+        dup2_stderr(&devnull)
+            .map_err(|e| KuroError::ExecFailed(format!("Failed dup2 stderr (child): {}", e)))?;
+
         // [x]   Pause for 'kuro start' signal
         println!("[kuro] Container initialized and paused, ready to start");
         ExecFifo::wait_for_start(fifo)?;
@@ -392,7 +407,7 @@ impl<'a> CBuilder<'a> {
         };
 
         // Handle interactive terminal (PTY)
-        TermMgr::setup_terminal(interactive, &console_stream)?;
+        TermMgr::setup_terminal(true, &console_stream)?;
 
         Self::start(self.spec)?;
 

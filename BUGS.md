@@ -76,8 +76,9 @@ Started container alp-test...
 ```
 
 #### Insights
-- Start command logs properly and starts container, but command (here, 'sh') doesn't appear on terminal (probably issue with attaching stdin/stdout/stder). Status = stopped (was 'created' before this).
-- No logs being printed after the point of child waiting for signal from fifo pipe (for some reason child isn't getting unblocked I think)
+- Capabilities not working: logging permitted Capabilities, operation not supported
+- Capabilities not working: logging permitted capabilities, operation not permitted:
+  - panicked: Ok(Err(Capability("Error setting permitted capabilities: caps error: capset failure: Operation not permitted (os error 1)")))
 
 
 # Fixed Bugs
@@ -94,3 +95,11 @@ Started container alp-test...
   - But that's pure coincidence of timing. Actual issue is related to the named pipe (fifo).
   - It opens the file as read-only, and at that moment the writer count on it is 0. When later called a read(), rule is if there are currently 0 writers open, read() returns 0 (EOF) immediately. Clearing NONBLOCK doesn't matter.
 - Fixing terminal with libc::dup2() results in create command hanging after opening pipe.
+- Start command spawns shell:
+  - Issue: I had to run the binary as sudo for necessary permissions for creating container
+  - But sudo sets up its own pts (stdio handles)
+  - When create runs, it set master as that sudo stdio and slave as container's stdio
+  - After execution, since sudo ends, its stdio handles are also destroyed, thus leaving no master for the slave
+  - Fix: isolate child's stdio handles in run_child_init after signalling parent that child setup is complete
+- Capabilities not working: logging bounding Capabilities, operation not supported:
+  - Bounding caps can't be set, but rather what we have to do is see which capabilities are not in target bounding caps and drop those individually.
