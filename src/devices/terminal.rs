@@ -21,23 +21,22 @@ pub struct TermMgr;
 
 impl TermMgr {
     /// Setup container IO depending on whether terminal is interactive (PTY) or not
-    pub fn setup_terminal(interactive: bool, console_steeam: &Option<UnixStream>) -> Result<()> {
-        if console_steeam.is_none() {
-            return Err(KuroError::SyncPipe(
-                "Console socket not connected".to_string(),
-            ));
-        }
-
+    pub fn setup_terminal(interactive: bool, console_stream: &Option<UnixStream>) -> Result<()> {
         if interactive {
+            // Get stream
+            let stream = console_stream
+                .as_ref()
+                .ok_or_else(|| KuroError::SyncPipe("Console socket not connected".to_string()))?;
+
             // Create PTY master/slave pair
             let OpenptyResult { master, slave } = openpty(None, None)
                 .map_err(|e| KuroError::ExecFailed(format!("Failed to openpty: {}", e)))?;
 
             // Send master fd to host (kuro start)
             println!("terminal: sending fd");
-            ConsoleSocket::send_fd(console_steeam.as_ref().unwrap(), master.as_raw_fd())?;
+            ConsoleSocket::send_fd(stream, master.as_raw_fd())?;
             println!("terminal: sent fd to socket");
-            drop(master); // receiver keeps it alive
+            // drop(master); // receiver keeps it alive
 
             setsid().map_err(|e| KuroError::ExecFailed(format!("Failed to setsid: {}", e)))?;
 

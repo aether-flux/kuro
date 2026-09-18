@@ -82,88 +82,6 @@ DOC.md
 <files>
 This section contains the contents of the repository's files.
 
-<file path="src/sync/console.rs">
-use std::{
-    fs,
-    io::{IoSlice, IoSliceMut},
-    os::{
-        fd::{AsRawFd, RawFd},
-        unix::net::{UnixListener, UnixStream},
-    },
-    path::Path,
-};
-
-use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
-
-use crate::error::{KuroError, Result};
-
-pub struct ConsoleSocket;
-
-impl ConsoleSocket {
-    /// Host: bind a fresh socket
-    pub fn listen(path: &Path) -> Result<UnixListener> {
-        let _ = fs::remove_file(&path);
-        UnixListener::bind(&path).map_err(|e| {
-            KuroError::ExecFailed(format!("Failed to bind console socket {:?}: {}", path, e))
-        })
-    }
-
-    /// Host: accept one connection only and receive master PTY fd
-    pub fn recv_fd(listener: &UnixListener) -> Result<RawFd> {
-        let (stream, _) = listener.accept().map_err(|e| {
-            KuroError::ExecFailed(format!("Failed to accept console connection: {}", e))
-        })?;
-        let raw_fd = stream.as_raw_fd();
-
-        let mut byte = [0u8; 1];
-        let mut iov = [IoSliceMut::new(&mut byte)];
-        let mut cmsg_buffer = nix::cmsg_space!([RawFd; 1]);
-
-        let msg = recvmsg::<()>(raw_fd, &mut iov, Some(&mut cmsg_buffer), MsgFlags::empty())
-            .map_err(|e| {
-                KuroError::ExecFailed(format!("recvmsg on console socket failed: {}", e))
-            })?;
-
-        for cmsg in msg
-            .cmsgs()
-            .map_err(|e| KuroError::ExecFailed(format!("Failed to read cmsgs: {}", e)))?
-        {
-            if let ControlMessageOwned::ScmRights(fds) = cmsg {
-                if let Some(fd) = fds.into_iter().next() {
-                    return Ok(fd);
-                }
-            }
-        }
-
-        Err(KuroError::ExecFailed(
-            "No fd received over console socket".to_string(),
-        ))
-    }
-
-    /// Child: connect to socket and send master fd
-    pub fn send_fd(path: &Path, fd: RawFd) -> Result<()> {
-        let stream = UnixStream::connect(path).map_err(|e| {
-            KuroError::ExecFailed(format!(
-                "Failed to connect to console socket {:?}: {}",
-                path, e
-            ))
-        })?;
-        let raw_fd = stream.as_raw_fd();
-
-        let byte = [b'c'];
-        let iov = [IoSlice::new(&byte)];
-        let fds = [fd];
-        let cmsgs = [ControlMessage::ScmRights(&fds)];
-
-        sendmsg::<()>(raw_fd, &iov, &cmsgs, MsgFlags::empty(), None).map_err(|e| {
-            KuroError::ExecFailed(format!("sendmsg on console socket failed: {}", e))
-        })?;
-
-        Ok(())
-    }
-}
-</file>
-
 <file path="src/cli/commands.rs">
 use clap::{Parser, Subcommand};
 
@@ -385,112 +303,92 @@ pub mod devices;
 pub mod terminal;
 </file>
 
-<file path="src/devices/terminal.rs">
+<file path="src/sync/console.rs">
 use std::{
-    fs::{File, OpenOptions},
-    os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+    fs,
+    io::{IoSlice, IoSliceMut},
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::net::{UnixListener, UnixStream},
+    },
     path::Path,
 };
 
-use nix::{
-    pty::{OpenptyResult, openpty},
-    unistd::{dup2, dup2_stderr, dup2_stdin, dup2_stdout, setsid},
-};
+use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
 
-use crate::{
-    error::{KuroError, Result},
-    sync::console::ConsoleSocket,
-};
+use crate::error::{KuroError, Result};
 
-pub struct TermMgr;
+pub struct ConsoleSocket;
 
-impl TermMgr {
-    /// Setup container IO depending on whether terminal is interactive (PTY) or not
-    pub fn setup_terminal(interactive: bool, console_sock_path: &Path) -> Result<()> {
-        if interactive {
-            // Create PTY master/slave pair
-            let OpenptyResult { master, slave } = openpty(None, None)
-                .map_err(|e| KuroError::ExecFailed(format!("Failed to openpty: {}", e)))?;
-
-            // Send master fd to host (kuro start)
-            println!("terminal: sending fd");
-            ConsoleSocket::send_fd(&console_sock_path, master.as_raw_fd())?;
-            println!("terminal: sent fd to {:?}", console_sock_path);
-            drop(master); // receiver keeps it alive
-
-            setsid().map_err(|e| KuroError::ExecFailed(format!("Failed to setsid: {}", e)))?;
-
-            unsafe {
-                // TIOSCSTTY sets slave fd as the controlling terminal for this proc
-                if libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0) < 0 {
-                    // if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
-                    return Err(KuroError::ExecFailed(
-                        "Failed to set controlling terminal (TIOCSCTTY)".to_string(),
-                    ));
-                }
-            }
-
-            // Duplicate slave to stdin(fd0) stdout(fd1) stderr(fd2)
-            unsafe {
-                let slave_fd = slave.as_fd();
-                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(0.as_raw_fd()))
-                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdin failed: {}", e)))?;
-                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(1.as_raw_fd()))
-                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdout failed: {}", e)))?;
-                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(2.as_raw_fd()))
-                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stderr failed: {}", e)))?;
-                dup2_stdin(slave_fd)
-                    .map_err(|e| KuroError::ExecFailed(format!("dup2 stdin failed: {}", e)))?;
-                dup2_stdout(slave_fd)
-                    .map_err(|e| KuroError::ExecFailed(format!("dup2 stdout failed: {}", e)))?;
-                dup2_stderr(slave_fd)
-                    .map_err(|e| KuroError::ExecFailed(format!("dup2 stderr failed: {}", e)))?;
-                // for fd in 0..=2 {
-                //     if libc::dup2(slave_fd, fd) < 0 {
-                //         return Err(KuroError::ExecFailed(format!(
-                //             "dup2 to fd {} failed: {}",
-                //             fd,
-                //             std::io::Error::last_os_error()
-                //         )));
-                //     }
-                // }
-            }
-
-            // Return master fd so host can relay it to CLI IO
-            // let master_file = unsafe { File::from_raw_fd(master.into_raw_fd()) };
-            // Ok(Some(master_file))
-        } else {
-            // Non-interactive; ensure standard stream descriptors are valid
-            Self::ensure_std_descriptors()?;
-            // Ok(None)
-        }
-        Ok(())
+impl ConsoleSocket {
+    /// Host: bind a fresh socket
+    pub fn listen(path: &Path) -> Result<UnixListener> {
+        let _ = fs::remove_file(&path);
+        UnixListener::bind(&path).map_err(|e| {
+            KuroError::ExecFailed(format!("Failed to bind console socket {:?}: {}", path, e))
+        })
     }
 
-    fn ensure_std_descriptors() -> Result<()> {
-        for fd in 0..=2 {
-            if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
-                let dev_null = OpenOptions::new()
-                    .read(fd == 0)
-                    .write(fd != 0)
-                    .open("/dev/null")
-                    .map_err(|e| {
-                        KuroError::ExecFailed(format!("Failed to open /dev/null: {}", e))
-                    })?;
-                // unsafe {
-                //     dup2(dev_null.as_fd(), &mut OwnedFd::from_raw_fd(fd.as_raw_fd())).map_err(
-                //         |e| KuroError::ExecFailed(format!("dup2 to /dev/null failed: {}", e)),
-                //     )?;
-                // }
+    /// Host: accept one connection only and receive master PTY fd
+    pub fn recv_fd(listener: &UnixListener) -> Result<RawFd> {
+        let (stream, _) = listener.accept().map_err(|e| {
+            KuroError::ExecFailed(format!("Failed to accept console connection: {}", e))
+        })?;
+        let raw_fd = stream.as_raw_fd();
 
-                match fd {
-                    0 => dup2_stdin(dev_null.as_fd()),
-                    1 => dup2_stdout(dev_null.as_fd()),
-                    _ => dup2_stderr(dev_null.as_fd()),
+        let mut byte = [0u8; 1];
+        let mut iov = [IoSliceMut::new(&mut byte)];
+        let mut cmsg_buffer = nix::cmsg_space!([RawFd; 1]);
+
+        let msg = recvmsg::<()>(raw_fd, &mut iov, Some(&mut cmsg_buffer), MsgFlags::empty())
+            .map_err(|e| {
+                KuroError::ExecFailed(format!("recvmsg on console socket failed: {}", e))
+            })?;
+
+        for cmsg in msg
+            .cmsgs()
+            .map_err(|e| KuroError::ExecFailed(format!("Failed to read cmsgs: {}", e)))?
+        {
+            if let ControlMessageOwned::ScmRights(fds) = cmsg {
+                if let Some(fd) = fds.into_iter().next() {
+                    return Ok(fd);
                 }
-                .map_err(|e| KuroError::ExecFailed(format!("dup2 to /dev/null failed: {}", e)))?;
             }
         }
+
+        Err(KuroError::ExecFailed(
+            "No fd received over console socket".to_string(),
+        ))
+    }
+
+    /// Child: connect to unix stream
+    pub fn connect(path: &Path) -> Result<UnixStream> {
+        UnixStream::connect(path).map_err(|e| {
+            KuroError::ExecFailed(format!(
+                "Failed to connect to console socket {:?}: {}",
+                path, e
+            ))
+        })
+    }
+
+    /// Child: send master fd
+    pub fn send_fd(stream: &UnixStream, fd: RawFd) -> Result<()> {
+        // let stream = UnixStream::connect(path).map_err(|e| {
+        //     KuroError::ExecFailed(format!(
+        //         "Failed to connect to console socket {:?}: {}",
+        //         path, e
+        //     ))
+        // })?;
+        let raw_fd = stream.as_raw_fd();
+
+        let byte = [b'c'];
+        let iov = [IoSlice::new(&byte)];
+        let fds = [fd];
+        let cmsgs = [ControlMessage::ScmRights(&fds)];
+
+        sendmsg::<()>(raw_fd, &iov, &cmsgs, MsgFlags::empty(), None).map_err(|e| {
+            KuroError::ExecFailed(format!("sendmsg on console socket failed: {}", e))
+        })?;
 
         Ok(())
     }
@@ -764,6 +662,126 @@ impl ContainerCleanup {
                     "[kuro] WARN: Failed to remove state diirectory {:?}: {}",
                     self.state_dir, e
                 );
+            }
+        }
+
+        Ok(())
+    }
+}
+</file>
+
+<file path="src/devices/terminal.rs">
+use std::{
+    fs::{File, OpenOptions},
+    os::{
+        fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+        unix::net::UnixStream,
+    },
+    path::Path,
+};
+
+use nix::{
+    pty::{OpenptyResult, openpty},
+    unistd::{dup2, dup2_stderr, dup2_stdin, dup2_stdout, setsid},
+};
+
+use crate::{
+    error::{KuroError, Result},
+    sync::console::ConsoleSocket,
+};
+
+pub struct TermMgr;
+
+impl TermMgr {
+    /// Setup container IO depending on whether terminal is interactive (PTY) or not
+    pub fn setup_terminal(interactive: bool, console_stream: &Option<UnixStream>) -> Result<()> {
+        if interactive {
+            // Get stream
+            let stream = console_stream
+                .as_ref()
+                .ok_or_else(|| KuroError::SyncPipe("Console socket not connected".to_string()))?;
+
+            // Create PTY master/slave pair
+            let OpenptyResult { master, slave } = openpty(None, None)
+                .map_err(|e| KuroError::ExecFailed(format!("Failed to openpty: {}", e)))?;
+
+            // Send master fd to host (kuro start)
+            println!("terminal: sending fd");
+            ConsoleSocket::send_fd(stream, master.as_raw_fd())?;
+            println!("terminal: sent fd to socket");
+            // drop(master); // receiver keeps it alive
+
+            setsid().map_err(|e| KuroError::ExecFailed(format!("Failed to setsid: {}", e)))?;
+
+            unsafe {
+                // TIOSCSTTY sets slave fd as the controlling terminal for this proc
+                if libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0) < 0 {
+                    // if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(KuroError::ExecFailed(
+                        "Failed to set controlling terminal (TIOCSCTTY)".to_string(),
+                    ));
+                }
+            }
+
+            // Duplicate slave to stdin(fd0) stdout(fd1) stderr(fd2)
+            unsafe {
+                let slave_fd = slave.as_fd();
+                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(0.as_raw_fd()))
+                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdin failed: {}", e)))?;
+                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(1.as_raw_fd()))
+                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdout failed: {}", e)))?;
+                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(2.as_raw_fd()))
+                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stderr failed: {}", e)))?;
+                dup2_stdin(slave_fd)
+                    .map_err(|e| KuroError::ExecFailed(format!("dup2 stdin failed: {}", e)))?;
+                dup2_stdout(slave_fd)
+                    .map_err(|e| KuroError::ExecFailed(format!("dup2 stdout failed: {}", e)))?;
+                dup2_stderr(slave_fd)
+                    .map_err(|e| KuroError::ExecFailed(format!("dup2 stderr failed: {}", e)))?;
+                // for fd in 0..=2 {
+                //     if libc::dup2(slave_fd, fd) < 0 {
+                //         return Err(KuroError::ExecFailed(format!(
+                //             "dup2 to fd {} failed: {}",
+                //             fd,
+                //             std::io::Error::last_os_error()
+                //         )));
+                //     }
+                // }
+            }
+
+            // Return master fd so host can relay it to CLI IO
+            // let master_file = unsafe { File::from_raw_fd(master.into_raw_fd()) };
+            // Ok(Some(master_file))
+        } else {
+            // Non-interactive; ensure standard stream descriptors are valid
+            Self::ensure_std_descriptors()?;
+            // Ok(None)
+        }
+        Ok(())
+    }
+
+    fn ensure_std_descriptors() -> Result<()> {
+        for fd in 0..=2 {
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+                let dev_null = OpenOptions::new()
+                    .read(fd == 0)
+                    .write(fd != 0)
+                    .open("/dev/null")
+                    .map_err(|e| {
+                        KuroError::ExecFailed(format!("Failed to open /dev/null: {}", e))
+                    })?;
+                // unsafe {
+                //     dup2(dev_null.as_fd(), &mut OwnedFd::from_raw_fd(fd.as_raw_fd())).map_err(
+                //         |e| KuroError::ExecFailed(format!("dup2 to /dev/null failed: {}", e)),
+                //     )?;
+                // }
+
+                match fd {
+                    0 => dup2_stdin(dev_null.as_fd()),
+                    1 => dup2_stdout(dev_null.as_fd()),
+                    _ => dup2_stderr(dev_null.as_fd()),
+                }
+                .map_err(|e| KuroError::ExecFailed(format!("dup2 to /dev/null failed: {}", e)))?;
             }
         }
 
@@ -1446,6 +1464,38 @@ pub mod fifo;
 pub mod pipe;
 </file>
 
+<file path="src/main.rs">
+use clap::Parser;
+
+use crate::{
+    cli::{commands::CliArgs, handle::handle_commands},
+    error::Result,
+};
+
+mod cgroups;
+mod cli;
+mod config;
+mod container;
+mod devices;
+mod error;
+mod namespaces;
+mod sync;
+
+fn main() -> Result<()> {
+    let args = CliArgs::try_parse().unwrap_or_else(|e| e.exit());
+    if let Err(e) = handle_commands(&args) {
+        return Err(e);
+    }
+
+    Ok(())
+}
+</file>
+
+<file path=".gitignore">
+/target
+/alpinefs
+</file>
+
 <file path="Cargo.toml">
 [package]
 name = "kuro"
@@ -1475,6 +1525,13 @@ syscallz = "0.17.0"
 thiserror = "2.0.20"
 </file>
 
+<file path="src/namespaces/mod.rs">
+pub mod mount;
+pub mod netns;
+pub mod security;
+pub mod userns;
+</file>
+
 <file path="src/namespaces/mount.rs">
 use std::{
     fs,
@@ -1487,7 +1544,10 @@ use nix::{
 };
 use oci_spec::runtime::{Linux, Spec};
 
-use crate::error::{KuroError, Result};
+use crate::{
+    container::state::ContainerState,
+    error::{KuroError, Result},
+};
 
 // [x]   Masked and readonly paths
 
@@ -1556,6 +1616,24 @@ impl MountMgr {
             target: "overlay".to_string(),
             source: e,
         })?;
+
+        // Bind-mount the container's state directory
+        let state_dir = ContainerState::get_state_dir(container_id);
+        if state_dir.exists() {
+            let target = merged.join(state_dir.strip_prefix("/").unwrap_or(&state_dir));
+            fs::create_dir_all(&target)?;
+            mount(
+                Some(&state_dir),
+                &target,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .map_err(|e| KuroError::MountFailed {
+                target: target.to_string_lossy().to_string(),
+                source: e,
+            })?;
+        }
 
         // pivot_root into isolated mount space
         Self::setup_pivot_root(&merged)?;
@@ -1827,38 +1905,6 @@ impl MountMgr {
 }
 </file>
 
-<file path="src/main.rs">
-use clap::Parser;
-
-use crate::{
-    cli::{commands::CliArgs, handle::handle_commands},
-    error::Result,
-};
-
-mod cgroups;
-mod cli;
-mod config;
-mod container;
-mod devices;
-mod error;
-mod namespaces;
-mod sync;
-
-fn main() -> Result<()> {
-    let args = CliArgs::try_parse().unwrap_or_else(|e| e.exit());
-    if let Err(e) = handle_commands(&args) {
-        return Err(e);
-    }
-
-    Ok(())
-}
-</file>
-
-<file path=".gitignore">
-/target
-/alpinefs
-</file>
-
 <file path="BUGS.md">
 ## Run 1
 
@@ -1939,6 +1985,7 @@ Started container alp-test...
 
 #### Insights
 - Start command logs properly and starts container, but command (here, 'sh') doesn't appear on terminal (probably issue with attaching stdin/stdout/stder). Status = stopped (was 'created' before this).
+- No logs being printed after the point of child waiting for signal from fifo pipe (for some reason child isn't getting unblocked I think)
 
 
 # Fixed Bugs
@@ -1955,13 +2002,6 @@ Started container alp-test...
   - But that's pure coincidence of timing. Actual issue is related to the named pipe (fifo).
   - It opens the file as read-only, and at that moment the writer count on it is 0. When later called a read(), rule is if there are currently 0 writers open, read() returns 0 (EOF) immediately. Clearing NONBLOCK doesn't matter.
 - Fixing terminal with libc::dup2() results in create command hanging after opening pipe.
-</file>
-
-<file path="src/namespaces/mod.rs">
-pub mod mount;
-pub mod netns;
-pub mod security;
-pub mod userns;
 </file>
 
 <file path="src/cli/handle.rs">
@@ -2122,7 +2162,7 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
             println!("status saved");
 
             // [x]   Execute poststart hooks (runtime)
-            CBuilder::run_hook(&spec, &container_id, "poststart")?;
+            CBuilder::run_hook(&spec, container_id, "poststart")?;
 
             println!("Started container {}...", container_id);
 
@@ -2388,9 +2428,8 @@ use std::{
     fs::File,
     io::Write,
     os::fd::AsFd,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Stdio},
-    time::Duration,
 };
 
 use crate::{
@@ -2400,6 +2439,7 @@ use crate::{
     error::{KuroError, Result},
     namespaces::{mount::MountMgr, netns::NetMgr, security::SecMgr, userns::UserMgr},
     sync::{
+        console::ConsoleSocket,
         fifo::ExecFifo,
         pipe::{SyncPipe, SyncResult},
     },
@@ -2446,7 +2486,7 @@ impl<'a> CBuilder<'a> {
             };
 
             if let Some(list) = hook_list {
-                let state = ContainerState::load(&container_id)?;
+                let state = ContainerState::load(container_id)?;
                 let state_json = serde_json::to_string(&state).map_err(|e| {
                     KuroError::Hook(format!("Failed to serialize container state: {}", e))
                 })?;
@@ -2564,8 +2604,8 @@ impl<'a> CBuilder<'a> {
         println!("state updated from host");
 
         // Child setup completed; can run hooks now
-        Self::run_hook(&self.spec, &self.container_id, "prestart")?;
-        Self::run_hook(&self.spec, &self.container_id, "createRuntime")?;
+        Self::run_hook(self.spec, &self.container_id, "prestart")?;
+        Self::run_hook(self.spec, &self.container_id, "createRuntime")?;
 
         // Signal child that parent has run hooks
         parent_to_child.send_ready()?;
@@ -2628,12 +2668,12 @@ impl<'a> CBuilder<'a> {
             .collect::<Result<Vec<_>>>()?;
 
         // Drop privileges finally
-        SecMgr::setup_security(&spec)?;
-        if let Some(linux) = spec.linux() {
-            if let Some(seccomp) = linux.seccomp() {
-                SecMgr::apply_seccomp(&seccomp)?;
-            }
-        }
+        // SecMgr::setup_security(&spec)?;
+        // if let Some(linux) = spec.linux() {
+        //     if let Some(seccomp) = linux.seccomp() {
+        //         SecMgr::apply_seccomp(seccomp)?;
+        //     }
+        // }
 
         // Call execve
         execve(&path, &argv, &envp)
@@ -2704,8 +2744,8 @@ impl<'a> CBuilder<'a> {
 
             // Apply masked and readonly paths
             if let Some(linux) = self.spec.linux() {
-                MountMgr::set_masked(&linux)?;
-                MountMgr::set_readonly(&linux)?;
+                MountMgr::set_masked(linux)?;
+                MountMgr::set_readonly(linux)?;
             }
 
             Ok(())
@@ -2745,7 +2785,7 @@ impl<'a> CBuilder<'a> {
         }
 
         // Parent has run hooks, now child will run hook
-        if let Err(e) = Self::run_hook(&self.spec, &self.container_id, "createContainer") {
+        if let Err(e) = Self::run_hook(self.spec, &self.container_id, "createContainer") {
             let _ = child_to_parent.send_err(&e.to_string());
             return Err(e);
         }
@@ -2759,20 +2799,27 @@ impl<'a> CBuilder<'a> {
 
         // Unblocked -> Call start method
         println!("unblocked child");
-        Self::run_hook(&self.spec, &self.container_id, "startContainer")?;
+        Self::run_hook(self.spec, &self.container_id, "startContainer")?;
 
-        // Handle interactive terminal (PTY)
+        // Connect to console socket
+        let console_socket_path =
+            ContainerState::get_state_dir(&self.container_id).join("console.sock");
         let interactive = self
             .spec
             .process()
             .as_ref()
             .and_then(|p| p.terminal())
             .unwrap_or(false);
-        let console_socket_path =
-            ContainerState::get_state_dir(&self.container_id).join("console.sock");
-        TermMgr::setup_terminal(interactive, &console_socket_path)?;
+        let console_stream = if interactive {
+            Some(ConsoleSocket::connect(&console_socket_path)?)
+        } else {
+            None
+        };
 
-        Self::start(&self.spec)?;
+        // Handle interactive terminal (PTY)
+        TermMgr::setup_terminal(interactive, &console_stream)?;
+
+        Self::start(self.spec)?;
 
         Ok(())
     }
@@ -2786,23 +2833,21 @@ impl<'a> CBuilder<'a> {
 
         if let Some(path) = path {
             // Path provided; attach existing namespace
-            let fd = File::open(&path).map_err(|e| {
+            let fd = File::open(path).map_err(|e| {
                 KuroError::Namespace(format!("Failed to open namespace path: {}", e))
             })?;
             if let Some(flag) = Self::get_clone_flag(typ) {
                 setns(fd.as_fd(), flag).map_err(|e| {
                     KuroError::Namespace(format!(
                         "Failed to set namespace '{}' to path '{:?}': {}",
-                        typ.to_string(),
-                        path,
-                        e
+                        typ, path, e
                     ))
                 })?;
             } else {
                 // Unsupported flags / namespace types (time)
                 return Err(KuroError::Namespace(format!(
                     "Unsupported namespace type: {}",
-                    typ.to_string()
+                    typ,
                 )));
             }
         } else {
@@ -2836,7 +2881,7 @@ impl<'a> CBuilder<'a> {
             | LinuxNamespaceType::Pid
             | LinuxNamespaceType::Uts
             | LinuxNamespaceType::Ipc
-            | LinuxNamespaceType::Cgroup => return Ok(()),
+            | LinuxNamespaceType::Cgroup => Ok(()),
             _ => Err(KuroError::Namespace(
                 "Unsupported namespace type".to_string(),
             )),
