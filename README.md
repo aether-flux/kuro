@@ -1,0 +1,2 @@
+# Kuro
+> WARN: txt

@@ -1,4 +1,4 @@
 /target
 /alpinefs
-DOC.md
-*.xml
+./DOC.md
+./repomix-output.xml
