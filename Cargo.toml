@@ -1,5 +1,5 @@
 [package]
-name = "kuro"
+name = "kuro-run"
 version = "0.1.0"
 edition = "2024"
 authors = ["Amartya Chowdhury work.amar05@yahoo.com"]
