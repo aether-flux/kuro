@@ -139,17 +139,6 @@ impl CgroupMgr {
         Ok(())
     }
 
-    /// Clean up cgroup
-    pub fn destroy(&self) -> Result<()> {
-        if self.path.exists() {
-            std::fs::remove_dir(&self.path).map_err(|e| {
-                KuroError::Cgroup(format!("Failed to remove cgroup directory: {}", e))
-            })?;
-        }
-
-        Ok(())
-    }
-
     /// Apply device filters
     pub fn apply_device_rules(cgroup_path: &Path, rules: &[LinuxDeviceCgroup]) -> Result<()> {
         for rule in rules {

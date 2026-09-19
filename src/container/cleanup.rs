@@ -17,8 +17,8 @@ pub struct ContainerCleanup {
 impl ContainerCleanup {
     /// Create new cleaner instance
     pub fn new(container_id: &str, pid: Option<i32>) -> Self {
-        let cgroup_path = PathBuf::from("/sys/fs/cgroup/kuro").join(&container_id);
-        let state_dir = ContainerState::get_state_dir(&container_id);
+        let cgroup_path = PathBuf::from("/sys/fs/cgroup/kuro").join(container_id);
+        let state_dir = ContainerState::get_state_dir(container_id);
 
         Self {
             container_id: container_id.to_string(),

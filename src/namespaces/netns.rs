@@ -1,11 +1,5 @@
-use std::{fs::File, os::fd::AsFd, path::Path, process::Command};
-
-use nix::{
-    sched::{CloneFlags, setns},
-    unistd::Pid,
-};
-
 use crate::error::{KuroError, Result};
+use std::process::Command;
 
 pub struct NetMgr;
 
@@ -20,7 +14,7 @@ impl NetMgr {
     /// Bring up loopback device in new namespace
     fn bring_up_loopback() -> Result<()> {
         let status = Command::new("ip")
-            .args(&["link", "set", "dev", "lo", "up"])
+            .args(["link", "set", "dev", "lo", "up"])
             .status()?;
 
         if !status.success() {

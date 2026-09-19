@@ -2,6 +2,13 @@
 name = "kuro"
 version = "0.1.0"
 edition = "2024"
+authors = ["Amartya Chowdhury work.amar05@yahoo.com"]
+description = "An experimental OCI container runtime built in Rust."
+readme = "README.md"
+repository = "https://github.com/aether-flux/kuro"
+license = "MIT"
+keywords = ["container", "oci", "runtime", "namespaces", "linux"]
+categories = ["command-line-utilities", "os::linux-apis"]
 
 [dependencies]
 caps = { version = "0.5.6", features = ["serde", "serde_support"] }

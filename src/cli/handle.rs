@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     fs,
     io::{Read, Write},
     os::fd::FromRawFd,
@@ -24,7 +23,7 @@ use crate::{
         state::{ContainerState, ContainerStatus},
     },
     error::{KuroError, Result, validate_id},
-    sync::{console::ConsoleSocket, fifo::ExecFifo, pipe::SyncPipe},
+    sync::{console::ConsoleSocket, fifo::ExecFifo},
 };
 
 pub fn handle_commands(args: &CliArgs) -> Result<()> {
@@ -132,7 +131,6 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
                     container_id
                 )));
             }
-            println!("state loaded");
 
             let spec = load_spec(&PathBuf::from(&state.bundle))?;
             let interactive = spec
@@ -140,9 +138,8 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
                 .as_ref()
                 .and_then(|p| p.terminal())
                 .unwrap_or(false);
-            println!("spec loaded, interactive = {}", interactive);
 
-            let state_dir = ContainerState::get_state_dir(&container_id);
+            let state_dir = ContainerState::get_state_dir(container_id);
             let socket_path = state_dir.join("console.sock");
 
             let console_listener = if interactive {
@@ -150,16 +147,13 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
             } else {
                 None
             };
-            println!("console listener: {:?}", console_listener);
 
             // Signal PID 1 to start container
             ExecFifo::signal_start(&state_dir)?;
-            println!("signal sent");
 
             // Update status -> Running
             state.status = ContainerStatus::Running;
             state.save()?;
-            println!("status saved");
 
             // [x]   Execute poststart hooks (runtime)
             CBuilder::run_hook(&spec, container_id, "poststart")?;
@@ -168,7 +162,6 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
 
             if let Some(listener) = console_listener {
                 let master_fd = ConsoleSocket::recv_fd(&listener)?;
-                println!("received fd");
                 let _ = fs::remove_file(&socket_path);
 
                 let master_file = unsafe { fs::File::from_raw_fd(master_fd) };
@@ -225,7 +218,7 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
 
         // // State
         Commands::State { container_id } => {
-            validate_id(&container_id)?;
+            validate_id(container_id)?;
 
             let state = ContainerState::load(container_id)?;
             println!("{}", serde_json::to_string_pretty(&state).unwrap());
@@ -236,7 +229,7 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
             container_id,
             signal,
         } => {
-            validate_id(&container_id)?;
+            validate_id(container_id)?;
 
             let sig_str = if signal.trim().is_empty() {
                 "SIGTERM"
@@ -244,12 +237,12 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
                 signal.as_str()
             };
             let sig = parse_signal(sig_str)?;
-            let state = ContainerState::load(&container_id)?;
+            let state = ContainerState::load(container_id)?;
 
             if state.status == ContainerStatus::Stopped {
                 return Err(KuroError::InvalidArgs(format!(
                     "Container '{}' is already stopped",
-                    &container_id
+                    container_id
                 )));
             }
 
@@ -296,8 +289,6 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
             if let Some(s) = &state {
                 let bundle_path = PathBuf::from(&s.bundle);
                 if let Ok(spec) = load_spec(&bundle_path) {
-                    // let builder = CBuilder::new(container_id.to_owned(), bundle_path, &spec);
-                    // builder.run_hook("poststop")?;
                     CBuilder::run_hook(&spec, container_id, "poststop")?;
                 }
             }

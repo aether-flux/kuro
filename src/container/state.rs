@@ -73,26 +73,14 @@ impl ContainerState {
         let mut state: ContainerState = serde_json::from_str(&data)?;
 
         // Check if host PID is still alive
-        if state.status == ContainerStatus::Running || state.status == ContainerStatus::Created {
-            if state.pid > 0 {
-                // signal None (0) checks if process exists without sending any signal
-                if kill(Pid::from_raw(state.pid), None).is_err() {
-                    state.status = ContainerStatus::Stopped;
-                    let _ = state.save();
-                }
-            }
+        if (state.status == ContainerStatus::Running || state.status == ContainerStatus::Created)
+            && (state.pid > 0 && kill(Pid::from_raw(state.pid), None).is_err())
+        {
+            // signal None (0) checks if process exists without sending any signal
+            state.status = ContainerStatus::Stopped;
+            let _ = state.save();
         }
 
         Ok(state)
-    }
-
-    /// Cleanup state file
-    pub fn destroy(container_id: &str) -> Result<()> {
-        let dir = Self::get_state_dir(container_id);
-        if dir.exists() {
-            fs::remove_dir_all(dir)?;
-        }
-
-        Ok(())
     }
 }

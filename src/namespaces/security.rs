@@ -1,4 +1,4 @@
-use std::{collections::HashSet, env};
+use std::collections::HashSet;
 
 use caps::{CapSet, Capability, CapsHashSet};
 use nix::{
@@ -33,11 +33,6 @@ impl SecMgr {
                 Self::set_no_new_privs(val)?;
             }
 
-            // Set capabilities before dropping UID
-            // if let Some(caps) = proc.capabilities() {
-            //     Self::set_caps_pre_user(caps)?;
-            // }
-
             // Drop/set UID/GID
             Self::set_user(proc.user())?;
 
@@ -52,58 +47,6 @@ impl SecMgr {
     }
 
     /// Setup capabilities
-    // fn set_caps(cap_spec: &LinuxCapabilities) -> Result<()> {
-    //     // Helper to parse capability strings "CAP_SYS_ADMIN" or "SYS_ADMIN"
-    //     let parse_caps =
-    //         |caps_set: Option<&HashSet<oci_spec::runtime::Capability>>| -> CapsHashSet {
-    //             caps_set
-    //                 .map(|set| {
-    //                     set.iter()
-    //                         .filter_map(|c| {
-    //                             let cap_str = c.to_string();
-    //                             let name = cap_str.strip_prefix("CAP_").unwrap_or(&cap_str);
-    //                             name.parse::<Capability>().ok()
-    //                         })
-    //                         .collect()
-    //                 })
-    //                 .unwrap_or_default()
-    //         };
-    //
-    //     // Bounding capabilities
-    //     let bounding = parse_caps(cap_spec.bounding().as_ref());
-    //     caps::set(None, CapSet::Bounding, &bounding).map_err(|e| {
-    //         KuroError::Capability(format!("Error setting bounding capabilities: {}", e))
-    //     })?;
-    //
-    //     // Inheritable capabilities
-    //     let inheritable = parse_caps(cap_spec.inheritable().as_ref());
-    //     caps::set(None, CapSet::Inheritable, &inheritable).map_err(|e| {
-    //         KuroError::Capability(format!("Error setting inheritable capabilities: {}", e))
-    //     })?;
-    //
-    //     // Permitted capabilities
-    //     let permitted = parse_caps(cap_spec.permitted().as_ref());
-    //     caps::set(None, CapSet::Permitted, &permitted).map_err(|e| {
-    //         KuroError::Capability(format!("Error setting permitted capabilities: {}", e))
-    //     })?;
-    //
-    //     // Effective capabilities
-    //     let effective = parse_caps(cap_spec.effective().as_ref());
-    //     caps::set(None, CapSet::Effective, &effective).map_err(|e| {
-    //         KuroError::Capability(format!("Error setting effective capabilities: {}", e))
-    //     })?;
-    //
-    //     // Ambient capabilities
-    //     let ambient = parse_caps(cap_spec.ambient().as_ref());
-    //     if !ambient.is_empty() {
-    //         caps::set(None, CapSet::Ambient, &ambient).map_err(|e| {
-    //             KuroError::Capability(format!("Error setting ambient capabilities: {}", e))
-    //         })?;
-    //     }
-    //
-    //     Ok(())
-    // }
-
     fn set_caps(cap_spec: &LinuxCapabilities, user: &User) -> Result<()> {
         // Helper to parse capability strings "CAP_SYS_ADMIN" or "SYS_ADMIN"
         let parse_caps =
@@ -176,9 +119,6 @@ impl SecMgr {
             KuroError::Capability(format!("Error clearing ambient capabilities: {}", e))
         })?;
         for cap in &target_ambient {
-            // caps::raise(None, CapSet::Ambient, *cap).map_err(|e| {
-            //     KuroError::Capability(format!("Error raising ambient capability {:?}: {}", cap, e))
-            // })?;
             if valid_perm.contains(cap) && inheritable.contains(cap) {
                 if let Err(e) = caps::raise(None, CapSet::Ambient, *cap) {
                     eprintln!("WARN: Could not raise ambient capability {:?}: {}", cap, e);
@@ -227,7 +167,7 @@ impl SecMgr {
             setrlimit(rsrc, limit.soft(), limit.hard()).map_err(|e| {
                 KuroError::Rlimits(format!(
                     "Failed to set rlimit '{} {} {}': {}",
-                    limit.typ().to_string(),
+                    limit.typ(),
                     limit.soft(),
                     limit.hard(),
                     e
@@ -243,19 +183,6 @@ impl SecMgr {
         if val {
             set_no_new_privs()
                 .map_err(|e| KuroError::NoNewPrivs(format!("Error setting no_new_privs: {}", e)))?;
-        }
-
-        Ok(())
-    }
-
-    /// Set environment variables
-    fn set_env_vars(vars: &Vec<String>) -> Result<()> {
-        for var in vars {
-            if let Some((key, val)) = var.split_once('=') {
-                unsafe {
-                    env::set_var(key, val);
-                }
-            }
         }
 
         Ok(())

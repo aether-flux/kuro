@@ -139,5 +139,5 @@ impl DevMgr {
 }
 
 fn makedev(major: u64, minor: u64) -> dev_t {
-    unsafe { libc::makedev(major as u32, minor as u32) }
+    libc::makedev(major as u32, minor as u32)
 }

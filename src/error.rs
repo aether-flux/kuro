@@ -38,9 +38,6 @@ pub enum KuroError {
     #[error("Container '{id}' is already running")]
     ContainerAlreadyExists { id: String },
 
-    #[error("Container cleanup error: {0}")]
-    ContainerCleanup(String),
-
     #[error("Error with config specification: {0}")]
     OciSpecError(#[from] OciSpecError),
 

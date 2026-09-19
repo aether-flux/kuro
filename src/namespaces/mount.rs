@@ -20,20 +20,15 @@ pub struct MountMgr;
 
 impl MountMgr {
     /// Setup new mount namespace
-    pub fn setup_mount(spec: &Spec, container_id: &str, bundle: &PathBuf) -> Result<()> {
-        Self::setup_overlayfs(&spec, container_id, bundle)?;
-        Self::mount_fs(&spec)?;
-
-        // if let Some(linux) = spec.linux() {
-        //     Self::set_masked(&linux)?;
-        //     Self::set_readonly(&linux)?;
-        // }
+    pub fn setup_mount(spec: &Spec, container_id: &str, bundle: &Path) -> Result<()> {
+        Self::setup_overlayfs(spec, container_id, bundle)?;
+        Self::mount_fs(spec)?;
 
         Ok(())
     }
 
     /// Setup overlayfs
-    fn setup_overlayfs(spec: &Spec, container_id: &str, bundle: &PathBuf) -> Result<()> {
+    fn setup_overlayfs(spec: &Spec, container_id: &str, bundle: &Path) -> Result<()> {
         // Define dir paths
         let base = bundle.join(container_id);
         let upper = base.join("upper");
@@ -129,7 +124,6 @@ impl MountMgr {
         // Handle old root safely
         let old_root = root.join("old_root");
         fs::create_dir_all(&old_root)?;
-        // WARN: If bugs arise, change "." to &root
         pivot_root(&root, &old_root)
             .map_err(|e| KuroError::Mount(format!("Failed to pivot root: {}", e)))?;
 
@@ -155,17 +149,9 @@ impl MountMgr {
             for mnt in mounts {
                 let dest = mnt.destination();
 
-                // If /sys was already mounted as read-only, creating /sys/fs/cgroup will fail
-                // So we ensure parent directory exists before mounting
-                // if let Some(parent) = dest.parent() {
-                //     if !parent.exists() {
-                //         let _ = fs::create_dir_all(parent);
-                //     }
-                // }
-
                 // Ensure destination path exists
                 if !dest.exists() {
-                    fs::create_dir_all(&dest)?;
+                    fs::create_dir_all(dest)?;
                 }
 
                 // Parse mount options
@@ -182,12 +168,11 @@ impl MountMgr {
                 let mut fstype = mnt.typ().as_deref();
 
                 // cgroup mount (special case)
-                if fstype == Some("cgroup") {
-                    if Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
-                        || Path::new("/sys/fs/cgroup/").exists()
-                    {
-                        fstype = Some("cgroup2");
-                    }
+                if (fstype == Some("cgroup"))
+                    && (Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+                        || Path::new("/sys/fs/cgroup/").exists())
+                {
+                    fstype = Some("cgroup2");
                 }
 
                 // Check if bind mount
@@ -226,13 +211,6 @@ impl MountMgr {
                     }
                 } else {
                     // Regular mount
-                    // mount(source, dest, fstype, flags, data).map_err(|e| {
-                    //     KuroError::MountFailed {
-                    //         target: dest.to_string_lossy().to_string(),
-                    //         source: e,
-                    //     }
-                    // })?;
-
                     if let Err(e) = mount(source, dest, fstype, flags, data) {
                         if fstype == Some("cgroup") || fstype == Some("cgroup2") {
                             mount(

@@ -17,8 +17,8 @@ pub struct ConsoleSocket;
 impl ConsoleSocket {
     /// Host: bind a fresh socket
     pub fn listen(path: &Path) -> Result<UnixListener> {
-        let _ = fs::remove_file(&path);
-        UnixListener::bind(&path).map_err(|e| {
+        let _ = fs::remove_file(path);
+        UnixListener::bind(path).map_err(|e| {
             KuroError::ExecFailed(format!("Failed to bind console socket {:?}: {}", path, e))
         })
     }
@@ -67,12 +67,6 @@ impl ConsoleSocket {
 
     /// Child: send master fd
     pub fn send_fd(stream: &UnixStream, fd: RawFd) -> Result<()> {
-        // let stream = UnixStream::connect(path).map_err(|e| {
-        //     KuroError::ExecFailed(format!(
-        //         "Failed to connect to console socket {:?}: {}",
-        //         path, e
-        //     ))
-        // })?;
         let raw_fd = stream.as_raw_fd();
 
         let byte = [b'c'];
