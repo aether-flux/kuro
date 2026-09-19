@@ -58,7 +58,7 @@ cd kuro
 cargo build --release
 
 # Move to path (optional, but recommended)
-sudo cp target/release/kuro /usr/local/bin/
+sudo cp target/release/kuro-run /usr/local/bin/
 ```
 
 ---
