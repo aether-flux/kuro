@@ -670,126 +670,6 @@ impl ContainerCleanup {
 }
 </file>
 
-<file path="src/devices/terminal.rs">
-use std::{
-    fs::{File, OpenOptions},
-    os::{
-        fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
-        unix::net::UnixStream,
-    },
-    path::Path,
-};
-
-use nix::{
-    pty::{OpenptyResult, openpty},
-    unistd::{dup2, dup2_stderr, dup2_stdin, dup2_stdout, setsid},
-};
-
-use crate::{
-    error::{KuroError, Result},
-    sync::console::ConsoleSocket,
-};
-
-pub struct TermMgr;
-
-impl TermMgr {
-    /// Setup container IO depending on whether terminal is interactive (PTY) or not
-    pub fn setup_terminal(interactive: bool, console_stream: &Option<UnixStream>) -> Result<()> {
-        if interactive {
-            // Get stream
-            let stream = console_stream
-                .as_ref()
-                .ok_or_else(|| KuroError::SyncPipe("Console socket not connected".to_string()))?;
-
-            // Create PTY master/slave pair
-            let OpenptyResult { master, slave } = openpty(None, None)
-                .map_err(|e| KuroError::ExecFailed(format!("Failed to openpty: {}", e)))?;
-
-            // Send master fd to host (kuro start)
-            println!("terminal: sending fd");
-            ConsoleSocket::send_fd(stream, master.as_raw_fd())?;
-            println!("terminal: sent fd to socket");
-            // drop(master); // receiver keeps it alive
-
-            setsid().map_err(|e| KuroError::ExecFailed(format!("Failed to setsid: {}", e)))?;
-
-            unsafe {
-                // TIOSCSTTY sets slave fd as the controlling terminal for this proc
-                if libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0) < 0 {
-                    // if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
-                    return Err(KuroError::ExecFailed(
-                        "Failed to set controlling terminal (TIOCSCTTY)".to_string(),
-                    ));
-                }
-            }
-
-            // Duplicate slave to stdin(fd0) stdout(fd1) stderr(fd2)
-            unsafe {
-                let slave_fd = slave.as_fd();
-                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(0.as_raw_fd()))
-                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdin failed: {}", e)))?;
-                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(1.as_raw_fd()))
-                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdout failed: {}", e)))?;
-                // dup2(slave_fd, &mut OwnedFd::from_raw_fd(2.as_raw_fd()))
-                //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stderr failed: {}", e)))?;
-                dup2_stdin(slave_fd)
-                    .map_err(|e| KuroError::ExecFailed(format!("dup2 stdin failed: {}", e)))?;
-                dup2_stdout(slave_fd)
-                    .map_err(|e| KuroError::ExecFailed(format!("dup2 stdout failed: {}", e)))?;
-                dup2_stderr(slave_fd)
-                    .map_err(|e| KuroError::ExecFailed(format!("dup2 stderr failed: {}", e)))?;
-                // for fd in 0..=2 {
-                //     if libc::dup2(slave_fd, fd) < 0 {
-                //         return Err(KuroError::ExecFailed(format!(
-                //             "dup2 to fd {} failed: {}",
-                //             fd,
-                //             std::io::Error::last_os_error()
-                //         )));
-                //     }
-                // }
-            }
-
-            // Return master fd so host can relay it to CLI IO
-            // let master_file = unsafe { File::from_raw_fd(master.into_raw_fd()) };
-            // Ok(Some(master_file))
-        } else {
-            // Non-interactive; ensure standard stream descriptors are valid
-            Self::ensure_std_descriptors()?;
-            // Ok(None)
-        }
-        Ok(())
-    }
-
-    fn ensure_std_descriptors() -> Result<()> {
-        for fd in 0..=2 {
-            if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
-                let dev_null = OpenOptions::new()
-                    .read(fd == 0)
-                    .write(fd != 0)
-                    .open("/dev/null")
-                    .map_err(|e| {
-                        KuroError::ExecFailed(format!("Failed to open /dev/null: {}", e))
-                    })?;
-                // unsafe {
-                //     dup2(dev_null.as_fd(), &mut OwnedFd::from_raw_fd(fd.as_raw_fd())).map_err(
-                //         |e| KuroError::ExecFailed(format!("dup2 to /dev/null failed: {}", e)),
-                //     )?;
-                // }
-
-                match fd {
-                    0 => dup2_stdin(dev_null.as_fd()),
-                    1 => dup2_stdout(dev_null.as_fd()),
-                    _ => dup2_stderr(dev_null.as_fd()),
-                }
-                .map_err(|e| KuroError::ExecFailed(format!("dup2 to /dev/null failed: {}", e)))?;
-            }
-        }
-
-        Ok(())
-    }
-}
-</file>
-
 <file path="src/namespaces/netns.rs">
 use std::{fs::File, os::fd::AsFd, path::Path, process::Command};
 
@@ -1143,6 +1023,205 @@ impl ContainerState {
 }
 </file>
 
+<file path="src/sync/fifo.rs">
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+};
+
+use libc::O_NONBLOCK;
+use nix::{sys::stat::Mode, unistd::mkfifo};
+
+use crate::error::{KuroError, Result};
+
+pub struct ExecFifo;
+
+impl ExecFifo {
+    /// Create FIFO path
+    pub fn create_path(container_dir: &Path) -> PathBuf {
+        container_dir.join("exec.fifo")
+    }
+
+    /// Create FIFO pipe
+    pub fn init(container_dir: &Path) -> Result<PathBuf> {
+        let path = Self::create_path(&container_dir);
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+
+        mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to create '{:?}': {}", &path, e)))?;
+        Ok(path)
+    }
+
+    /// Open file while host /run is available
+    pub fn open_for_read(fifo_path: &Path) -> Result<File> {
+        // File::open(&fifo_path)
+        //     .map_err(|e| KuroError::SyncPipe(format!("Failed to open '{:?}': {}", &fifo_path, e)))
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(fifo_path)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to open '{:?}': {}", &fifo_path, e)))
+    }
+
+    /// Wait on already-opened file descriptor
+    pub fn wait_for_start(fifo_file: File) -> Result<()> {
+        // Clear O_NONBLOCK so read_exact() can now block
+        // use std::os::unix::io::AsRawFd;
+        // let fd = fifo_file.as_raw_fd();
+        // unsafe {
+        //     let flags = libc::fcntl(fd, libc::F_GETFL);
+        //     libc::fcntl(fd, libc::F_SETFL, flags & !O_NONBLOCK);
+        // }
+
+        let mut fifo_file = fifo_file;
+        let mut buf = [0u8; 1];
+        fifo_file
+            .read_exact(&mut buf)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to read signal: {}", e)))?;
+        Ok(())
+    }
+
+    /// Send signal to child to unblock
+    pub fn signal_start(container_dir: &Path) -> Result<()> {
+        let path = Self::create_path(&container_dir);
+        let mut fifo = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to create '{:?}': {}", &path, e)))?;
+        fifo.write_all(&[1u8])
+            .map_err(|e| KuroError::SyncPipe(format!("Failed to send signal: {}", e)))?;
+
+        Ok(())
+    }
+}
+</file>
+
+<file path="src/devices/terminal.rs">
+use std::{
+    fs::{File, OpenOptions},
+    os::{
+        fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+        unix::net::UnixStream,
+    },
+    path::Path,
+};
+
+use nix::{
+    pty::{OpenptyResult, openpty},
+    unistd::{dup2, dup2_stderr, dup2_stdin, dup2_stdout, setsid},
+};
+
+use crate::{
+    error::{KuroError, Result},
+    sync::console::ConsoleSocket,
+};
+
+pub struct TermMgr;
+
+impl TermMgr {
+    /// Setup container IO depending on whether terminal is interactive (PTY) or not
+    pub fn setup_terminal(interactive: bool, console_stream: &Option<UnixStream>) -> Result<()> {
+        if interactive {
+            // Get stream
+            let stream = console_stream
+                .as_ref()
+                .ok_or_else(|| KuroError::SyncPipe("Console socket not connected".to_string()))?;
+
+            // Create PTY master/slave pair
+            let OpenptyResult { master, slave } = openpty(None, None)
+                .map_err(|e| KuroError::ExecFailed(format!("Failed to openpty: {}", e)))?;
+
+            // Send master fd to host (kuro start)
+            println!("terminal: sending fd");
+            ConsoleSocket::send_fd(stream, master.as_raw_fd())?;
+            println!("terminal: sent fd to socket");
+            // drop(master); // receiver keeps it alive
+
+            setsid().map_err(|e| KuroError::ExecFailed(format!("Failed to setsid: {}", e)))?;
+
+            unsafe {
+                // TIOSCSTTY sets slave fd as the controlling terminal for this proc
+                if libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0) < 0 {
+                    // if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(KuroError::ExecFailed(
+                        "Failed to set controlling terminal (TIOCSCTTY)".to_string(),
+                    ));
+                }
+            }
+
+            // Duplicate slave to stdin(fd0) stdout(fd1) stderr(fd2)
+            // unsafe {
+            // let slave_fd = slave.as_fd();
+            // dup2(slave_fd, &mut OwnedFd::from_raw_fd(0.as_raw_fd()))
+            //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdin failed: {}", e)))?;
+            // dup2(slave_fd, &mut OwnedFd::from_raw_fd(1.as_raw_fd()))
+            //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stdout failed: {}", e)))?;
+            // dup2(slave_fd, &mut OwnedFd::from_raw_fd(2.as_raw_fd()))
+            //     .map_err(|e| KuroError::ExecFailed(format!("dup2 stderr failed: {}", e)))?;
+            dup2_stdin(&slave)
+                .map_err(|e| KuroError::ExecFailed(format!("dup2 stdin failed: {}", e)))?;
+            dup2_stdout(&slave)
+                .map_err(|e| KuroError::ExecFailed(format!("dup2 stdout failed: {}", e)))?;
+            dup2_stderr(&slave)
+                .map_err(|e| KuroError::ExecFailed(format!("dup2 stderr failed: {}", e)))?;
+            // for fd in 0..=2 {
+            //     if libc::dup2(slave_fd, fd) < 0 {
+            //         return Err(KuroError::ExecFailed(format!(
+            //             "dup2 to fd {} failed: {}",
+            //             fd,
+            //             std::io::Error::last_os_error()
+            //         )));
+            //     }
+            // }
+            // }
+
+            drop(slave);
+
+            // Return master fd so host can relay it to CLI IO
+            // let master_file = unsafe { File::from_raw_fd(master.into_raw_fd()) };
+            // Ok(Some(master_file))
+        } else {
+            // Non-interactive; ensure standard stream descriptors are valid
+            Self::ensure_std_descriptors()?;
+            // Ok(None)
+        }
+        Ok(())
+    }
+
+    fn ensure_std_descriptors() -> Result<()> {
+        for fd in 0..=2 {
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+                let dev_null = OpenOptions::new()
+                    .read(fd == 0)
+                    .write(fd != 0)
+                    .open("/dev/null")
+                    .map_err(|e| {
+                        KuroError::ExecFailed(format!("Failed to open /dev/null: {}", e))
+                    })?;
+                // unsafe {
+                //     dup2(dev_null.as_fd(), &mut OwnedFd::from_raw_fd(fd.as_raw_fd())).map_err(
+                //         |e| KuroError::ExecFailed(format!("dup2 to /dev/null failed: {}", e)),
+                //     )?;
+                // }
+
+                match fd {
+                    0 => dup2_stdin(dev_null.as_fd()),
+                    1 => dup2_stdout(dev_null.as_fd()),
+                    _ => dup2_stderr(dev_null.as_fd()),
+                }
+                .map_err(|e| KuroError::ExecFailed(format!("dup2 to /dev/null failed: {}", e)))?;
+            }
+        }
+
+        Ok(())
+    }
+}
+</file>
+
 <file path="src/namespaces/security.rs">
 use std::{collections::HashSet, env};
 
@@ -1179,12 +1258,18 @@ impl SecMgr {
                 Self::set_no_new_privs(val)?;
             }
 
+            // Set capabilities before dropping UID
+            // if let Some(caps) = proc.capabilities() {
+            //     Self::set_caps_pre_user(caps)?;
+            // }
+
             // Drop/set UID/GID
             Self::set_user(proc.user())?;
 
-            // Set capabilities
+            // Apply effective capabilities after dropping UID
             if let Some(caps) = proc.capabilities() {
-                Self::set_caps(caps)?;
+                // Self::set_caps_effective(caps)?;
+                Self::set_caps(caps, proc.user())?;
             }
         }
 
@@ -1192,7 +1277,59 @@ impl SecMgr {
     }
 
     /// Setup capabilities
-    fn set_caps(cap_spec: &LinuxCapabilities) -> Result<()> {
+    // fn set_caps(cap_spec: &LinuxCapabilities) -> Result<()> {
+    //     // Helper to parse capability strings "CAP_SYS_ADMIN" or "SYS_ADMIN"
+    //     let parse_caps =
+    //         |caps_set: Option<&HashSet<oci_spec::runtime::Capability>>| -> CapsHashSet {
+    //             caps_set
+    //                 .map(|set| {
+    //                     set.iter()
+    //                         .filter_map(|c| {
+    //                             let cap_str = c.to_string();
+    //                             let name = cap_str.strip_prefix("CAP_").unwrap_or(&cap_str);
+    //                             name.parse::<Capability>().ok()
+    //                         })
+    //                         .collect()
+    //                 })
+    //                 .unwrap_or_default()
+    //         };
+    //
+    //     // Bounding capabilities
+    //     let bounding = parse_caps(cap_spec.bounding().as_ref());
+    //     caps::set(None, CapSet::Bounding, &bounding).map_err(|e| {
+    //         KuroError::Capability(format!("Error setting bounding capabilities: {}", e))
+    //     })?;
+    //
+    //     // Inheritable capabilities
+    //     let inheritable = parse_caps(cap_spec.inheritable().as_ref());
+    //     caps::set(None, CapSet::Inheritable, &inheritable).map_err(|e| {
+    //         KuroError::Capability(format!("Error setting inheritable capabilities: {}", e))
+    //     })?;
+    //
+    //     // Permitted capabilities
+    //     let permitted = parse_caps(cap_spec.permitted().as_ref());
+    //     caps::set(None, CapSet::Permitted, &permitted).map_err(|e| {
+    //         KuroError::Capability(format!("Error setting permitted capabilities: {}", e))
+    //     })?;
+    //
+    //     // Effective capabilities
+    //     let effective = parse_caps(cap_spec.effective().as_ref());
+    //     caps::set(None, CapSet::Effective, &effective).map_err(|e| {
+    //         KuroError::Capability(format!("Error setting effective capabilities: {}", e))
+    //     })?;
+    //
+    //     // Ambient capabilities
+    //     let ambient = parse_caps(cap_spec.ambient().as_ref());
+    //     if !ambient.is_empty() {
+    //         caps::set(None, CapSet::Ambient, &ambient).map_err(|e| {
+    //             KuroError::Capability(format!("Error setting ambient capabilities: {}", e))
+    //         })?;
+    //     }
+    //
+    //     Ok(())
+    // }
+
+    fn set_caps(cap_spec: &LinuxCapabilities, user: &User) -> Result<()> {
         // Helper to parse capability strings "CAP_SYS_ADMIN" or "SYS_ADMIN"
         let parse_caps =
             |caps_set: Option<&HashSet<oci_spec::runtime::Capability>>| -> CapsHashSet {
@@ -1209,37 +1346,68 @@ impl SecMgr {
                     .unwrap_or_default()
             };
 
-        // Bounding capabilities
-        let bounding = parse_caps(cap_spec.bounding().as_ref());
-        caps::set(None, CapSet::Bounding, &bounding).map_err(|e| {
-            KuroError::Capability(format!("Error setting bounding capabilities: {}", e))
-        })?;
-
-        // Inheritable capabilities
+        let target_bounding = parse_caps(cap_spec.bounding().as_ref());
         let inheritable = parse_caps(cap_spec.inheritable().as_ref());
+        let target_permitted = parse_caps(cap_spec.permitted().as_ref());
+        let target_effective = parse_caps(cap_spec.effective().as_ref());
+        let target_ambient = parse_caps(cap_spec.ambient().as_ref());
+
+        // Bounding caps
+        let cur_bounding = caps::read(None, CapSet::Bounding).map_err(|e| {
+            KuroError::Capability(format!("Error reading bounding capabilities: {}", e))
+        })?;
+        for cap in cur_bounding {
+            if !target_bounding.contains(&cap) {
+                if let Err(e) = caps::drop(None, CapSet::Bounding, cap) {
+                    eprintln!("WARN: Could not drop bounding capability {:?}: {}", cap, e);
+                }
+            }
+        }
+
+        // Inheritable caps
         caps::set(None, CapSet::Inheritable, &inheritable).map_err(|e| {
             KuroError::Capability(format!("Error setting inheritable capabilities: {}", e))
         })?;
 
-        // Permitted capabilities
-        let permitted = parse_caps(cap_spec.permitted().as_ref());
-        caps::set(None, CapSet::Permitted, &permitted).map_err(|e| {
+        // Permitted caps
+        let cur_perm = caps::read(None, CapSet::Permitted).map_err(|e| {
+            KuroError::Capability(format!("Error reading permitted capabilities: {}", e))
+        })?;
+        let valid_perm: CapsHashSet = target_permitted.intersection(&cur_perm).cloned().collect();
+        caps::set(None, CapSet::Permitted, &valid_perm).map_err(|e| {
             KuroError::Capability(format!("Error setting permitted capabilities: {}", e))
         })?;
 
-        // Effective capabilities
-        let effective = parse_caps(cap_spec.effective().as_ref());
-        caps::set(None, CapSet::Effective, &effective).map_err(|e| {
+        // Enable PR_SET_KEEPCAPS so capabilities persist across setresuid/setresgid
+        if user.uid() != 0 {
+            unsafe {
+                libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0);
+            }
+        }
+
+        // Ambient caps
+        caps::clear(None, CapSet::Ambient).map_err(|e| {
+            KuroError::Capability(format!("Error clearing ambient capabilities: {}", e))
+        })?;
+        for cap in &target_ambient {
+            // caps::raise(None, CapSet::Ambient, *cap).map_err(|e| {
+            //     KuroError::Capability(format!("Error raising ambient capability {:?}: {}", cap, e))
+            // })?;
+            if valid_perm.contains(cap) && inheritable.contains(cap) {
+                if let Err(e) = caps::raise(None, CapSet::Ambient, *cap) {
+                    eprintln!("WARN: Could not raise ambient capability {:?}: {}", cap, e);
+                }
+            }
+        }
+
+        // Effective caps
+        let valid_eff: CapsHashSet = target_effective
+            .intersection(&valid_perm)
+            .cloned()
+            .collect();
+        caps::set(None, CapSet::Effective, &valid_eff).map_err(|e| {
             KuroError::Capability(format!("Error setting effective capabilities: {}", e))
         })?;
-
-        // Ambient capabilities
-        let ambient = parse_caps(cap_spec.ambient().as_ref());
-        if !ambient.is_empty() {
-            caps::set(None, CapSet::Ambient, &ambient).map_err(|e| {
-                KuroError::Capability(format!("Error setting ambient capabilities: {}", e))
-            })?;
-        }
 
         Ok(())
     }
@@ -1377,83 +1545,6 @@ impl SecMgr {
         };
 
         Ok(res)
-    }
-}
-</file>
-
-<file path="src/sync/fifo.rs">
-use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
-};
-
-use libc::O_NONBLOCK;
-use nix::{sys::stat::Mode, unistd::mkfifo};
-
-use crate::error::{KuroError, Result};
-
-pub struct ExecFifo;
-
-impl ExecFifo {
-    /// Create FIFO path
-    pub fn create_path(container_dir: &Path) -> PathBuf {
-        container_dir.join("exec.fifo")
-    }
-
-    /// Create FIFO pipe
-    pub fn init(container_dir: &Path) -> Result<PathBuf> {
-        let path = Self::create_path(&container_dir);
-        if path.exists() {
-            let _ = fs::remove_file(&path);
-        }
-
-        mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR)
-            .map_err(|e| KuroError::SyncPipe(format!("Failed to create '{:?}': {}", &path, e)))?;
-        Ok(path)
-    }
-
-    /// Open file while host /run is available
-    pub fn open_for_read(fifo_path: &Path) -> Result<File> {
-        // File::open(&fifo_path)
-        //     .map_err(|e| KuroError::SyncPipe(format!("Failed to open '{:?}': {}", &fifo_path, e)))
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(fifo_path)
-            .map_err(|e| KuroError::SyncPipe(format!("Failed to open '{:?}': {}", &fifo_path, e)))
-    }
-
-    /// Wait on already-opened file descriptor
-    pub fn wait_for_start(fifo_file: File) -> Result<()> {
-        // Clear O_NONBLOCK so read_exact() can now block
-        // use std::os::unix::io::AsRawFd;
-        // let fd = fifo_file.as_raw_fd();
-        // unsafe {
-        //     let flags = libc::fcntl(fd, libc::F_GETFL);
-        //     libc::fcntl(fd, libc::F_SETFL, flags & !O_NONBLOCK);
-        // }
-
-        let mut fifo_file = fifo_file;
-        let mut buf = [0u8; 1];
-        fifo_file
-            .read_exact(&mut buf)
-            .map_err(|e| KuroError::SyncPipe(format!("Failed to read signal: {}", e)))?;
-        Ok(())
-    }
-
-    /// Send signal to child to unblock
-    pub fn signal_start(container_dir: &Path) -> Result<()> {
-        let path = Self::create_path(&container_dir);
-        let mut fifo = OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .map_err(|e| KuroError::SyncPipe(format!("Failed to create '{:?}': {}", &path, e)))?;
-        fifo.write_all(&[1u8])
-            .map_err(|e| KuroError::SyncPipe(format!("Failed to send signal: {}", e)))?;
-
-        Ok(())
     }
 }
 </file>
@@ -1984,8 +2075,9 @@ Started container alp-test...
 ```
 
 #### Insights
-- Start command logs properly and starts container, but command (here, 'sh') doesn't appear on terminal (probably issue with attaching stdin/stdout/stder). Status = stopped (was 'created' before this).
-- No logs being printed after the point of child waiting for signal from fifo pipe (for some reason child isn't getting unblocked I think)
+- Capabilities not working: logging permitted Capabilities, operation not supported
+- Capabilities not working: logging permitted capabilities, operation not permitted:
+  - panicked: Ok(Err(Capability("Error setting permitted capabilities: caps error: capset failure: Operation not permitted (os error 1)")))
 
 
 # Fixed Bugs
@@ -2002,6 +2094,14 @@ Started container alp-test...
   - But that's pure coincidence of timing. Actual issue is related to the named pipe (fifo).
   - It opens the file as read-only, and at that moment the writer count on it is 0. When later called a read(), rule is if there are currently 0 writers open, read() returns 0 (EOF) immediately. Clearing NONBLOCK doesn't matter.
 - Fixing terminal with libc::dup2() results in create command hanging after opening pipe.
+- Start command spawns shell:
+  - Issue: I had to run the binary as sudo for necessary permissions for creating container
+  - But sudo sets up its own pts (stdio handles)
+  - When create runs, it set master as that sudo stdio and slave as container's stdio
+  - After execution, since sudo ends, its stdio handles are also destroyed, thus leaving no master for the slave
+  - Fix: isolate child's stdio handles in run_child_init after signalling parent that child setup is complete
+- Capabilities not working: logging bounding Capabilities, operation not supported:
+  - Bounding caps can't be set, but rather what we have to do is see which capabilities are not in target bounding caps and drop those individually.
 </file>
 
 <file path="src/cli/handle.rs">
@@ -2425,7 +2525,7 @@ pub fn validate_id(container_id: &str) -> Result<()> {
 <file path="src/container/builder.rs">
 use std::{
     ffi::CString,
-    fs::File,
+    fs::{self, File},
     io::Write,
     os::fd::AsFd,
     path::PathBuf,
@@ -2447,7 +2547,7 @@ use crate::{
 use nix::{
     sched::{CloneFlags, clone, setns},
     sys::signal::Signal,
-    unistd::{Pid, execve, sethostname},
+    unistd::{Pid, dup2_stderr, dup2_stdin, dup2_stdout, execve, sethostname},
 };
 use oci_spec::runtime::{Hook, LinuxNamespaceType, Spec};
 
@@ -2515,11 +2615,14 @@ impl<'a> CBuilder<'a> {
 
         // Closure executed in child process
         let child_fn = Box::new(|| -> isize {
-            match self.run_child_init(&child_to_parent, &parent_to_child) {
-                Ok(_) => 0,
-                Err(e) => {
-                    eprintln!("[kuro] Error during initialization: {}", e);
-                    std::process::exit(1);
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.run_child_init(&child_to_parent, &parent_to_child)
+            }));
+            match r {
+                Ok(Ok(_)) => 0,
+                _ => {
+                    println!("panicked: {:?}", r);
+                    unsafe { libc::exit(1) }
                 }
             }
         });
@@ -2668,7 +2771,7 @@ impl<'a> CBuilder<'a> {
             .collect::<Result<Vec<_>>>()?;
 
         // Drop privileges finally
-        // SecMgr::setup_security(&spec)?;
+        SecMgr::setup_security(spec)?;
         // if let Some(linux) = spec.linux() {
         //     if let Some(seccomp) = linux.seccomp() {
         //         SecMgr::apply_seccomp(seccomp)?;
@@ -2793,6 +2896,18 @@ impl<'a> CBuilder<'a> {
         // Signal parent that child is ready and paused
         child_to_parent.send_ready()?;
 
+        // Detach child stdio
+        let devnull = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")?;
+        dup2_stdin(&devnull)
+            .map_err(|e| KuroError::ExecFailed(format!("Failed dup2 stdin (child): {}", e)))?;
+        dup2_stdout(&devnull)
+            .map_err(|e| KuroError::ExecFailed(format!("Failed dup2 stdout (child): {}", e)))?;
+        dup2_stderr(&devnull)
+            .map_err(|e| KuroError::ExecFailed(format!("Failed dup2 stderr (child): {}", e)))?;
+
         // [x]   Pause for 'kuro start' signal
         println!("[kuro] Container initialized and paused, ready to start");
         ExecFifo::wait_for_start(fifo)?;
@@ -2817,7 +2932,7 @@ impl<'a> CBuilder<'a> {
         };
 
         // Handle interactive terminal (PTY)
-        TermMgr::setup_terminal(interactive, &console_stream)?;
+        TermMgr::setup_terminal(true, &console_stream)?;
 
         Self::start(self.spec)?;
 

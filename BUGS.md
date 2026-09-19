@@ -76,9 +76,7 @@ Started container alp-test...
 ```
 
 #### Insights
-- Capabilities not working: logging permitted Capabilities, operation not supported
-- Capabilities not working: logging permitted capabilities, operation not permitted:
-  - panicked: Ok(Err(Capability("Error setting permitted capabilities: caps error: capset failure: Operation not permitted (os error 1)")))
+- Decide whether delete on running container should work or not (recommendation: add a --force flag and do accordingly)
 
 
 # Fixed Bugs
@@ -103,3 +101,7 @@ Started container alp-test...
   - Fix: isolate child's stdio handles in run_child_init after signalling parent that child setup is complete
 - Capabilities not working: logging bounding Capabilities, operation not supported:
   - Bounding caps can't be set, but rather what we have to do is see which capabilities are not in target bounding caps and drop those individually.
+- Capabilities not working: logging permitted Capabilities, operation not supported
+- Capabilities not working: logging permitted capabilities, operation not permitted:
+  - panicked: Ok(Err(Capability("Error setting permitted capabilities: caps error: capset failure: Operation not permitted (os error 1)")))
+  - caps::set(Permitted): Effective must be a subset of the set of caps to be set as Permitted

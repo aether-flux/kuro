@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -13,8 +15,16 @@ pub enum Commands {
 
     // Create container
     Create {
+        #[arg(long)]
+        bundle: PathBuf,
+
+        #[arg(long = "pid-file")]
+        pid_file: Option<PathBuf>,
+
+        #[arg(long = "console-socket")]
+        console_socket: Option<PathBuf>,
+
         container_id: String,
-        bundle_path: String,
     },
 
     // Start container
@@ -35,6 +45,9 @@ pub enum Commands {
 
     // Delete container
     Delete {
+        #[arg(short, long)]
+        force: bool,
+
         container_id: String,
     },
 }

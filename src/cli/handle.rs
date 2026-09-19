@@ -33,12 +33,20 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
         // // Create
         Commands::Create {
             container_id,
-            bundle_path,
+            bundle,
+            pid_file,
+            console_socket,
         } => {
-            validate_id(&container_id)?;
+            validate_id(container_id)?;
+
+            if let Ok(_) = ContainerState::load(container_id) {
+                return Err(KuroError::ContainerAlreadyExists {
+                    id: container_id.to_string(),
+                });
+            }
 
             // Validate bundle path
-            let bundle_path = PathBuf::from(bundle_path);
+            let bundle_path = PathBuf::from(bundle);
             if !bundle_path.exists() || !bundle_path.is_dir() {
                 return Err(KuroError::InvalidArgs(format!(
                     "bundle_path '{}' does not exist or is not a directory",
@@ -96,8 +104,7 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
             match builder.create() {
                 Ok(pid) => println!(
                     "[kuro] Container {} created successfully with PID {}",
-                    container_id,
-                    pid.to_string()
+                    container_id, pid
                 ),
                 Err(e) => {
                     eprintln!("[kuro] {}", e);
@@ -259,14 +266,30 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
         }
 
         // // Delete
-        Commands::Delete { container_id } => {
-            validate_id(&container_id)?;
+        Commands::Delete {
+            container_id,
+            force,
+        } => {
+            validate_id(container_id)?;
 
             println!("[kuro] Deleting container {}...", container_id);
 
-            let state = ContainerState::load(&container_id).ok();
-            let pid = state.as_ref().map(|s| s.pid);
+            let state = ContainerState::load(container_id).ok();
 
+            if state.is_none() {
+                return Err(KuroError::ContainerNotFound {
+                    id: container_id.to_string(),
+                });
+            }
+
+            if state.as_ref().unwrap().status == ContainerStatus::Running && !force {
+                return Err(KuroError::InvalidArgs(format!(
+                    "Container {} is currently running; use '--force' to kill a running container",
+                    container_id
+                )));
+            }
+
+            let pid = state.as_ref().map(|s| s.pid);
             ContainerCleanup::new(container_id, pid).cleanup()?;
 
             // Poststop hooks
@@ -275,7 +298,7 @@ pub fn handle_commands(args: &CliArgs) -> Result<()> {
                 if let Ok(spec) = load_spec(&bundle_path) {
                     // let builder = CBuilder::new(container_id.to_owned(), bundle_path, &spec);
                     // builder.run_hook("poststop")?;
-                    CBuilder::run_hook(&spec, &container_id, "poststop")?;
+                    CBuilder::run_hook(&spec, container_id, "poststop")?;
                 }
             }
 

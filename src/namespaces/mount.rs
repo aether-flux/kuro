@@ -101,15 +101,15 @@ impl MountMgr {
         }
 
         // pivot_root into isolated mount space
-        Self::setup_pivot_root(&merged)?;
+        Self::setup_pivot_root(spec, &merged)?;
 
         Ok(())
     }
 
     /// Setup pivot_root
-    fn setup_pivot_root(merged: &PathBuf) -> Result<()> {
+    fn setup_pivot_root(spec: &Spec, merged: &PathBuf) -> Result<()> {
         // Get absolute path of root
-        let root = fs::canonicalize(&merged)?;
+        let root = fs::canonicalize(merged)?;
         chdir(&root)
             .map_err(|e| KuroError::Mount(format!("Failed to chdir to new root: {}", e)))?;
 
@@ -134,7 +134,13 @@ impl MountMgr {
             .map_err(|e| KuroError::Mount(format!("Failed to pivot root: {}", e)))?;
 
         // Clean up old root
-        chdir("/")
+        let def_cwd = PathBuf::from("/");
+        let cwd = spec
+            .process()
+            .as_ref()
+            .and_then(|p| Some(p.cwd()))
+            .unwrap_or(&def_cwd);
+        chdir(cwd)
             .map_err(|e| KuroError::Mount(format!("Failed to change directory to '/': {}", e)))?;
         umount2("/old_root", MntFlags::MNT_DETACH)
             .map_err(|e| KuroError::Mount(format!("Failed to unmount /old_root: {}", e)))?;

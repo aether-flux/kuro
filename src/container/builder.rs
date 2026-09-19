@@ -247,11 +247,11 @@ impl<'a> CBuilder<'a> {
 
         // Drop privileges finally
         SecMgr::setup_security(spec)?;
-        // if let Some(linux) = spec.linux() {
-        //     if let Some(seccomp) = linux.seccomp() {
-        //         SecMgr::apply_seccomp(seccomp)?;
-        //     }
-        // }
+        if let Some(linux) = spec.linux() {
+            if let Some(seccomp) = linux.seccomp() {
+                SecMgr::apply_seccomp(seccomp)?;
+            }
+        }
 
         // Call execve
         execve(&path, &argv, &envp)

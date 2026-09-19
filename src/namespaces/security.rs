@@ -113,8 +113,14 @@ impl SecMgr {
                         set.iter()
                             .filter_map(|c| {
                                 let cap_str = c.to_string();
-                                let name = cap_str.strip_prefix("CAP_").unwrap_or(&cap_str);
-                                name.parse::<Capability>().ok()
+                                let name = format!("CAP_{}", cap_str.to_uppercase());
+                                match name.parse::<Capability>() {
+                                    Ok(cap) => Some(cap),
+                                    Err(e) => {
+                                        eprintln!("[kuro] WARN: failed to parse capability '{}' (from '{}'): {}", name, cap_str, e);
+                                        None
+                                    }
+                                }
                             })
                             .collect()
                     })
@@ -142,6 +148,11 @@ impl SecMgr {
         // Inheritable caps
         caps::set(None, CapSet::Inheritable, &inheritable).map_err(|e| {
             KuroError::Capability(format!("Error setting inheritable capabilities: {}", e))
+        })?;
+
+        // Effective must be a subset of to-be-set Permitted caps, so we clear Effective for now
+        caps::clear(None, CapSet::Effective).map_err(|e| {
+            KuroError::Capability(format!("Error clearing effective capabilities: {}", e))
         })?;
 
         // Permitted caps
